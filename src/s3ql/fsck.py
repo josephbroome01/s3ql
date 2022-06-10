@@ -11,11 +11,10 @@ from . import CURRENT_FS_REV, BUFSIZE, CTRL_INODE, ROOT_INODE
 from .backends.common import NoSuchObject
 from .backends.comprenc import ComprencBackend
 from .backends.local import Backend as LocalBackend
-from .common import (inode_for_path, sha256_fh, get_path, get_backend_cachedir,
-                     get_seq_no, is_mounted, get_backend, load_params,
-                     save_params, time_ns)
+from .common import (inode_for_path, sha256_fh, get_path, get_seq_no, is_mounted,
+                     get_backend, load_params, save_params, time_ns)
 from .database import NoSuchRowError, Connection
-from .metadata import create_tables, dump_and_upload_metadata, download_metadata
+from .metadata import dump_and_upload_metadata, download_metadata
 from .parse_args import ArgumentParser
 from os.path import basename
 import apsw
@@ -46,36 +45,34 @@ class Fsck(object):
         self.max_obj_size = param['max_obj_size']
         self.conn = conn
 
-        # Set of blocks that have been unlinked by check_cache.
-        # check_block_refcounts() will not report errors if these blocks still
+        # Set of objects that have been unlinked by check_cache.
+        # check_object_refcounts() will not report errors if these objects still
         # exist even though they have refcount=0
-        self.unlinked_blocks = set()
-
-        # Similarly for objects
         self.unlinked_objects = set()
 
-        # Set of inodes that have been moved to lost+found (so that we
-        # don't move them there repeatedly)
-        self.moved_inodes = set()
 
-    def check(self):
+    def check(self, check_cache=True):
         """Check file system
+
+        If *check_cache* is False, assume that all cache files are clean (aka
+        have been uploaded to the backend). If *check_cache* is ``keep``, do not
+        remove cache files on exit.
 
         Sets instance variable `found_errors`.
         """
 
         # Create indices required for reference checking
         log.info('Creating temporary extra indices...')
-        for idx in ('tmp1', 'tmp2', 'tmp3', 'tmp4', 'tmp5'):
+        for idx in ('tmp1', 'tmp2', 'tmp3', 'tmp4'):
             self.conn.execute('DROP INDEX IF EXISTS %s' % idx)
-        self.conn.execute('CREATE INDEX tmp1 ON blocks(obj_id)')
-        self.conn.execute('CREATE INDEX tmp2 ON inode_blocks(block_id)')
-        self.conn.execute('CREATE INDEX tmp3 ON contents(inode)')
-        self.conn.execute('CREATE INDEX tmp4 ON contents(name_id)')
-        self.conn.execute('CREATE INDEX tmp5 ON ext_attributes(name_id)')
+        self.conn.execute('CREATE INDEX tmp1 ON inode_blocks(obj_id)')
+        self.conn.execute('CREATE INDEX tmp2 ON contents(inode)')
+        self.conn.execute('CREATE INDEX tmp3 ON contents(name_id)')
+        self.conn.execute('CREATE INDEX tmp4 ON ext_attributes(name_id)')
         try:
             self.check_lof()
-            self.check_cache()
+            if check_cache:
+                self.check_cache(check_cache == 'keep')
             self.check_names_refcount()
 
             self.check_contents_name()
@@ -83,15 +80,13 @@ class Fsck(object):
             self.check_contents_parent_inode()
 
             self.check_objects_temp()
+            self.check_objects_hash()            
             self.check_objects_refcount()
             self.check_objects_id()
-            self.check_objects_size()
+            self.check_objects_phys_size()
+            # TODO: Are there any checks we could do on objects.length?
 
-            self.check_blocks_obj_id()
-            self.check_blocks_refcount()
-            self.check_blocks_checksum()
-
-            self.check_inode_blocks_block_id()
+            self.check_inode_blocks_obj_id()
             self.check_inode_blocks_inode()
 
             self.check_inodes_refcount()
@@ -107,14 +102,14 @@ class Fsck(object):
             self.check_foreign_keys()
         finally:
             log.info('Dropping temporary indices...')
-            for idx in ('tmp1', 'tmp2', 'tmp3', 'tmp4', 'tmp5'):
+            for idx in ('tmp1', 'tmp2', 'tmp3', 'tmp4'):
                 self.conn.execute('DROP INDEX %s' % idx)
 
     def log_error(self, *a, **kw):
         '''Log file system error if not expected'''
 
         if self.expect_errors:
-            return log.debug(*a, **kw)
+            return log.info(*a, **kw)
         else:
             return log.warning(*a, **kw)
 
@@ -133,15 +128,16 @@ class Fsck(object):
 
         for (table,) in self.conn.query("SELECT name FROM sqlite_master WHERE type='table'"):
             for row in self.conn.query('PRAGMA foreign_key_list(%s)' % table):
-                sql_objs = { 'src_table': table,
+                sql_objs = {'src_table': table,
                             'dst_table': row[2],
                             'src_col': row[3],
-                            'dst_col': row[4] }
+                            'dst_col': row[4],
+                            'dbf': self.conn.fixes['dbf']}
 
                 for (val,) in self.conn.query('SELECT %(src_table)s.%(src_col)s '
                                               'FROM %(src_table)s LEFT JOIN %(dst_table)s '
-                                              'ON %(src_table)s.%(src_col)s = %(dst_table)s.%(dst_col)s '
-                                              'WHERE %(dst_table)s.%(dst_col)s IS NULL '
+                                              'ON %(dbf)s%(src_table)s.%(src_col)s = %(dbf)s%(dst_table)s.%(dst_col)s '
+                                              'WHERE %(dbf)s%(dst_table)s.%(dst_col)s IS NULL '
                                               'AND %(src_table)s.%(src_col)s IS NOT NULL'
                                               % sql_objs):
                     self.found_errors = True
@@ -152,36 +148,71 @@ class Fsck(object):
                     self.uncorrectable_errors = True
 
 
-    def check_cache(self):
+    def check_cache(self, keep_cache=False):
         """Commit uncommitted cache files"""
 
-        log.info("Checking cached objects...")
+        log.info("Checking for dirty cache objects...")
         if not os.path.exists(self.cachedir):
             return
+        candidates = os.listdir(self.cachedir)
 
-        for filename in os.listdir(self.cachedir):
-            self.found_errors = True
+        if sys.stdout.isatty():
+            stamp1 = 0
+        else:
+            stamp1 = float('inf')
+
+        total = len(candidates)
+        for (i, filename) in enumerate(candidates):
+            i += 1 # start at 1
+            stamp2 = time.time()
+            if stamp2 - stamp1 > 1 or i == total:
+                sys.stdout.write('\r..processed %d/%d files (%d%%)..'
+                                 % (i, total, i/total*100))
+                sys.stdout.flush()
+                stamp1 = stamp2
 
             match = re.match('^(\\d+)-(\\d+)$', filename)
             if match:
                 inode = int(match.group(1))
                 blockno = int(match.group(2))
+            elif re.match('^(\\d+)-(\\d+)\\.tmp$', filename):
+                # Temporary file created when downloading object
+                self.found_errors = True
+                self.log_error("Removing leftover temporary file: " + filename)
+                os.unlink(os.path.join(self.cachedir, filename))
+                continue
             else:
                 raise RuntimeError('Strange file in cache directory: %s' % filename)
 
-            self.log_error("Committing block %d of inode %d to backend", blockno, inode)
-
+            # Calculate block checksum
             with open(os.path.join(self.cachedir, filename), "rb") as fh:
                 size = os.fstat(fh.fileno()).st_size
-                hash_ = sha256_fh(fh)
+                hash_should = sha256_fh(fh)
+            log.debug('%s has checksum %s', filename, hash_should)
+
+            # Check if stored object has same checksum
+            try:
+                (obj_id, hash_is) = self.conn.get_row(
+                    'SELECT obj_id, hash '
+                    'FROM inode_blocks JOIN objects ON obj_id = objects.id '
+                    'WHERE inode=? AND blockno=?', (inode, blockno,))
+            except NoSuchRowError:
+                pass
+            else:
+                if hash_should == hash_is:
+                    if not keep_cache:
+                        os.unlink(os.path.join(self.cachedir, filename))
+                    continue
+
+            self.found_errors = True
+            self.log_error("Writing dirty block %d of inode %d to backend", blockno, inode)
 
             try:
-                (block_id, obj_id) = self.conn.get_row('SELECT id, obj_id FROM blocks WHERE hash=?', (hash_,))
+                obj_id = self.conn.get_val('SELECT id FROM objects WHERE hash=?', (hash_should,))
 
             except NoSuchRowError:
-                obj_id = self.conn.rowid('INSERT INTO objects (refcount, size) VALUES(1, -1)')
-                block_id = self.conn.rowid('INSERT INTO blocks (refcount, hash, obj_id, size) '
-                                           'VALUES(?, ?, ?, ?)', (1, hash_, obj_id, size))
+                obj_id = self.conn.rowid('INSERT INTO objects (refcount, phys_size, length, hash) '
+                                         'VALUES(1, -1, ?, ?)', (size, hash_should))
                 def do_write(obj_fh):
                     with open(os.path.join(self.cachedir, filename), "rb") as fh:
                         shutil.copyfileobj(fh, obj_fh, BUFSIZE)
@@ -189,27 +220,28 @@ class Fsck(object):
 
                 obj_size = self.backend.perform_write(do_write, 's3ql_data_%d' % obj_id).get_obj_size()
 
-                self.conn.execute('UPDATE objects SET size=? WHERE id=?', (obj_size, obj_id))
-
+                self.conn.execute('UPDATE objects SET phys_size=? WHERE id=?', (obj_size, obj_id))
             else:
-                self.conn.execute('UPDATE blocks SET refcount=refcount+1 WHERE id=?', (block_id,))
+                self.conn.execute('UPDATE objects SET refcount=refcount+1 WHERE id=?', (obj_id,))
 
             try:
-                old_block_id = self.conn.get_val('SELECT block_id FROM inode_blocks '
-                                                 'WHERE inode=? AND blockno=?', (inode, blockno))
+                old_obj_id = self.conn.get_val('SELECT obj_id FROM inode_blocks '
+                                               'WHERE inode=? AND blockno=?', (inode, blockno))
             except NoSuchRowError:
-                self.conn.execute('INSERT INTO inode_blocks (block_id, inode, blockno) VALUES(?,?,?)',
-                                  (block_id, inode, blockno))
+                self.conn.execute('INSERT INTO inode_blocks (obj_id, inode, blockno) VALUES(?,?,?)',
+                                  (obj_id, inode, blockno))
             else:
-                self.conn.execute('UPDATE inode_blocks SET block_id=? WHERE inode=? AND blockno=?',
-                                  (block_id, inode, blockno))
+                self.conn.execute('UPDATE inode_blocks SET obj_id=? WHERE inode=? AND blockno=?',
+                                  (obj_id, inode, blockno))
 
-                # We just decrease the refcount, but don't take any action
+                # Decrease the refcount, but don't take any further action
                 # because the reference count might be wrong
-                self.conn.execute('UPDATE blocks SET refcount=refcount-1 WHERE id=?', (old_block_id,))
-                self.unlinked_blocks.add(old_block_id)
+                self.conn.execute('UPDATE objects SET refcount=refcount-1 WHERE id=?', 
+                                  (old_obj_id,))
+                self.unlinked_objects.add(old_obj_id)
 
-            os.unlink(os.path.join(self.cachedir, filename))
+            if not keep_cache:
+                os.unlink(os.path.join(self.cachedir, filename))
 
 
     def check_lof(self):
@@ -224,12 +256,21 @@ class Fsck(object):
 
         except NoSuchRowError:
             self.found_errors = True
-            self.log_error("Recreating missing lost+found directory")
-            inode_l = self.create_inode(mode=stat.S_IFDIR | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
-                                        atime_ns=now_ns, ctime_ns=now_ns, mtime_ns=now_ns,
-                                        refcount=1)
-            self.conn.execute("INSERT INTO contents (name_id, inode, parent_inode) VALUES(?,?,?)",
-                              (self._add_name(b"lost+found"), inode_l, ROOT_INODE))
+            try:
+                # A bug in sqlite made fsck.s3ql move lost+found into lost+found. We just move it back to the root.
+                (inode_l, name_id) = self.conn.get_row("SELECT inode, name_id FROM contents_v "
+                                                       "WHERE name=? AND parent_inode=inode",
+                                                       (b"lost+found",))
+                self.log_error("Moving lost+found directory to root")
+                self.conn.execute("UPDATE contents SET parent_inode = ? WHERE inode = ?",
+                                  (ROOT_INODE, inode_l))
+            except NoSuchRowError:
+                self.log_error("Recreating missing lost+found directory")
+                inode_l = self.create_inode(mode=stat.S_IFDIR | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+                                            atime_ns=now_ns, ctime_ns=now_ns, mtime_ns=now_ns,
+                                            refcount=1)
+                self.conn.execute("INSERT INTO contents (name_id, inode, parent_inode) VALUES(?,?,?)",
+                                  (self._add_name(b"lost+found"), inode_l, ROOT_INODE))
 
 
         mode = self.conn.get_val('SELECT mode FROM inodes WHERE id=?', (inode_l,))
@@ -252,8 +293,8 @@ class Fsck(object):
 
         for (rowid, name_id, inode_p,
              inode) in self.conn.query('SELECT contents.rowid, name_id, parent_inode, inode '
-                                       'FROM contents LEFT JOIN names '
-                                       'ON name_id = names.id WHERE names.id IS NULL'):
+                                       'FROM contents LEFT JOIN names ON %(dbf)sname_id = %(dbf)snames.id '
+                                       'WHERE %(dbf)snames.id IS NULL' % self.conn.fixes):
             self.found_errors = True
             try:
                 path = get_path(inode_p, self.conn)[1:]
@@ -278,7 +319,8 @@ class Fsck(object):
         for (rowid, inode_p,
              name_id) in self.conn.query('SELECT contents.rowid, parent_inode, name_id '
                                          'FROM contents LEFT JOIN inodes '
-                                         'ON parent_inode = inodes.id WHERE inodes.id IS NULL'):
+                                         'ON %(dbf)sparent_inode = %(dbf)sinodes.id '
+                                         'WHERE %(dbf)sinodes.id IS NULL' % self.conn.fixes):
             self.found_errors = True
             name = self.conn.get_val('SELECT name FROM names WHERE id = ?', (name_id,))
             (id_p_new, newname) = self.resolve_free(b"/lost+found",
@@ -299,7 +341,8 @@ class Fsck(object):
         to_delete = list()
         for (rowid, inode_p, inode, name_id) in self.conn.query('SELECT contents.rowid, parent_inode, inode, '
                                                                 'name_id FROM contents LEFT JOIN inodes '
-                                                                'ON inode = inodes.id WHERE inodes.id IS NULL'):
+                                                                'ON %(dbf)sinode = %(dbf)sinodes.id '
+                                                                'WHERE %(dbf)sinodes.id IS NULL' % self.conn.fixes):
             self.found_errors = True
             try:
                 path = get_path(inode, self.conn)[1:]
@@ -320,7 +363,8 @@ class Fsck(object):
 
         for (rowid, name_id, inode) in self.conn.query('SELECT ext_attributes.rowid, name_id, inode '
                                                        'FROM ext_attributes LEFT JOIN names '
-                                                       'ON name_id = names.id WHERE names.id IS NULL'):
+                                                       'ON %(dbf)sname_id = %(dbf)snames.id '
+                                                       'WHERE %(dbf)snames.id IS NULL' % self.conn.fixes):
 
             self.found_errors = True
             for (name, id_p) in self.conn.query('SELECT name, parent_inode '
@@ -347,7 +391,8 @@ class Fsck(object):
         to_delete = list()
         for (rowid, inode, name_id) in self.conn.query('SELECT ext_attributes.rowid, inode, name_id '
                                                        'FROM ext_attributes LEFT JOIN inodes '
-                                                       'ON inode = inodes.id WHERE inodes.id IS NULL'):
+                                                       'ON %(dbf)sinode = %(dbf)sinodes.id '
+                                                       'WHERE %(dbf)sinodes.id IS NULL' % self.conn.fixes):
             self.found_errors = True
             self.log_error('Extended attribute %d refers to non-existing inode %d, deleting',
                            rowid, inode)
@@ -424,8 +469,8 @@ class Fsck(object):
         try:
             self.conn.execute('''
             INSERT INTO min_sizes (id, min_size)
-            SELECT inode, MAX(blockno * ? + size)
-            FROM inode_blocks JOIN blocks ON block_id == blocks.id
+            SELECT inode, MAX(blockno * ? + length)
+            FROM inode_blocks JOIN objects ON obj_id == objects.id
             GROUP BY inode''', (self.max_obj_size,))
 
             self.conn.execute('''
@@ -458,10 +503,10 @@ class Fsck(object):
 
             self.conn.execute('''
                CREATE TEMPORARY TABLE wrong_refcounts AS
-               SELECT id, refcounts.refcount, inodes.refcount
-                 FROM inodes LEFT JOIN refcounts USING (id)
+               SELECT inodes.id, refcounts.refcount, inodes.refcount
+                 FROM inodes LEFT JOIN refcounts ON %(dbf)sinodes.id = %(dbf)srefcounts.id
                 WHERE inodes.refcount != refcounts.refcount
-                   OR refcounts.refcount IS NULL''')
+                   OR %(dbf)srefcounts.refcount IS NULL''' % self.conn.fixes)
 
             for (id_, cnt, cnt_old) in self.conn.query('SELECT * FROM wrong_refcounts'):
                 # No checks for root and control
@@ -485,72 +530,44 @@ class Fsck(object):
             self.conn.execute('DROP TABLE refcounts')
             self.conn.execute('DROP TABLE IF EXISTS wrong_refcounts')
 
-    def check_blocks_obj_id(self):
-        """Check blocks.obj_id"""
-
-        log.info('Checking blocks (referenced objects)...')
-
-        for (block_id, obj_id) in self.conn.query('SELECT blocks.id, obj_id FROM blocks LEFT JOIN objects '
-                                                  'ON obj_id = objects.id WHERE objects.id IS NULL'):
-            self.found_errors = True
-            self.log_error('Block %d refers to non-existing object %d', block_id, obj_id)
-            for (inode,) in self.conn.query('SELECT inode FROM inode_blocks WHERE block_id = ? ',
-                                            (block_id,)):
-                if inode in self.moved_inodes:
-                    continue
-                self.moved_inodes.add(inode)
-
-                affected_entries = list(self.conn.query('SELECT name, name_id, parent_inode '
-                                                        'FROM contents_v WHERE inode=?', (inode,)))
-                for (name, name_id, id_p) in affected_entries:
-                    path = get_path(id_p, self.conn, name)
-                    self.log_error("File may lack data, moved to /lost+found: %s", to_str(path))
-                    (lof_id, newname) = self.resolve_free(b"/lost+found", escape(path))
-
-                    self.conn.execute('UPDATE contents SET name_id=?, parent_inode=? '
-                                      'WHERE name_id=? AND parent_inode=?',
-                                      (self._add_name(newname), lof_id, name_id, id_p))
-                    self._del_name(name_id)
-
-            self.conn.execute('DELETE FROM inode_blocks WHERE block_id=?', (block_id,))
-            self.conn.execute("DELETE FROM blocks WHERE id=?", (block_id,))
-
-
     def check_inode_blocks_inode(self):
         """Check inode_blocks.inode"""
 
-        log.info('Checking inode-block mapping (inodes)...')
+        log.info('Checking inode_blocks.inode...')
 
         to_delete = list()
-        for (rowid, inode, block_id) in self.conn.query('SELECT inode_blocks.rowid, inode, block_id '
-                                                        'FROM inode_blocks  LEFT JOIN inodes '
-                                                        'ON inode = inodes.id WHERE inodes.id IS NULL'):
+        for (rowid, inode, obj_id) in self.conn.query('SELECT inode_blocks.rowid, inode, obj_id '
+                                                      'FROM inode_blocks LEFT JOIN inodes '
+                                                      'ON %(dbf)sinode = %(dbf)sinodes.id '
+                                                      'WHERE %(dbf)sinodes.id IS NULL' % self.conn.fixes):
             self.found_errors = True
             self.log_error('Inode-block mapping %d refers to non-existing inode %d, deleting',
                            rowid, inode)
             to_delete.append(rowid)
-            self.unlinked_blocks.add(block_id)
+            
+            # Decrease the refcount, but don't take any action because the
+            # reference count might be wrong
+            self.conn.execute('UPDATE objects SET refcount=refcount-1 WHERE id=?', 
+                              (obj_id,))
+            self.unlinked_objects.add(obj_id)
 
         for rowid in to_delete:
             self.conn.execute('DELETE FROM inode_blocks WHERE rowid=?', (rowid,))
 
-    def check_inode_blocks_block_id(self):
-        """Check inode_blocks.block_id"""
+    def check_inode_blocks_obj_id(self):
+        """Check inode_blocks.obj_id"""
 
-        log.info('Checking inode-block mapping (blocks)...')
+        log.info('Checking block-object mapping...')
 
         to_delete = list()
-        for (rowid, block_id, inode) in self.conn.query('SELECT inode_blocks.rowid, block_id, inode FROM inode_blocks '
-                                                        'LEFT JOIN blocks ON block_id = blocks.id '
-                                                        'WHERE blocks.id IS NULL'):
+        for (rowid, obj_id, inode) in self.conn.query(
+                'SELECT inode_blocks.rowid, obj_id, inode FROM inode_blocks '
+                'LEFT JOIN objects ON %(dbf)sobj_id = %(dbf)sobjects.id '
+                'WHERE %(dbf)sobjects.id IS NULL' % self.conn.fixes):
             self.found_errors = True
-            self.log_error('Inode-block mapping for inode %d refers to non-existing block %d',
-                           inode, block_id)
+            self.log_error('Inode-block mapping for inode %d refers to non-existing object %d',
+                           inode, obj_id)
             to_delete.append(rowid)
-
-            if inode in self.moved_inodes:
-                continue
-            self.moved_inodes.add(inode)
 
             affected_entries = list(self.conn.query('SELECT name, name_id, parent_inode '
                                                     'FROM contents_v WHERE inode=?', (inode,)))
@@ -574,7 +591,8 @@ class Fsck(object):
 
         to_delete = list()
         for (rowid, inode) in self.conn.query('SELECT symlink_targets.rowid, inode FROM symlink_targets '
-                                              'LEFT JOIN inodes ON inode = inodes.id WHERE inodes.id IS NULL'):
+                                              'LEFT JOIN inodes ON %(dbf)sinode = %(dbf)sinodes.id '
+                                              'WHERE %(dbf)sinodes.id IS NULL' % self.conn.fixes):
             self.found_errors = True
             self.log_error('Symlink %d refers to non-existing inode %d, deleting',
                            rowid, inode)
@@ -583,87 +601,26 @@ class Fsck(object):
         for rowid in to_delete:
             self.conn.execute('DELETE FROM symlink_targets WHERE rowid=?', (rowid,))
 
-    def check_blocks_refcount(self):
-        """Check blocks.refcount"""
 
-        log.info('Checking blocks (refcounts)...')
+    def check_objects_hash(self):
+        """Check objects.hash"""
 
-        self.conn.execute('CREATE TEMPORARY TABLE refcounts '
-                          '(id INTEGER PRIMARY KEY, refcount INTEGER NOT NULL)')
-        try:
-            self.conn.execute('''
-               INSERT INTO refcounts (id, refcount)
-                 SELECT block_id, COUNT(blockno)
-                 FROM inode_blocks
-                 GROUP BY block_id
-            ''')
+        log.info('Checking objects.hash...')
 
-            self.conn.execute('''
-               CREATE TEMPORARY TABLE wrong_refcounts AS
-               SELECT id, refcounts.refcount, blocks.refcount, obj_id
-                 FROM blocks LEFT JOIN refcounts USING (id)
-                WHERE blocks.refcount != refcounts.refcount
-                   OR refcounts.refcount IS NULL''')
+        count = self.conn.get_val('SELECT COUNT(id) FROM objects WHERE hash IS NULL')
+        if not count:
+            return
 
-            for (id_, cnt, cnt_old, obj_id) in self.conn.query('SELECT * FROM wrong_refcounts'):
-                if cnt is None and id_ in self.unlinked_blocks:
-                    # Block was unlinked by check_cache and can now really be
-                    # removed (since we have checked that there are truly no
-                    # other references)
-                    self.conn.execute('DELETE FROM blocks WHERE id=?', (id_,))
-
-                    # We can't remove associated objects yet, because their refcounts
-                    # might be wrong, too.
-                    self.conn.execute('UPDATE objects SET refcount=refcount-1 WHERE id=?', (obj_id,))
-                    self.unlinked_objects.add(obj_id)
-
-                elif cnt is None:
-                    self.found_errors = True
-                    (id_p, name) = self.resolve_free(b"/lost+found", ("block-%d" % id_).encode())
-                    self.log_error("Block %d not referenced, adding as /lost+found/%s",
-                                   id_, to_str(name))
-                    now_ns = time_ns()
-                    size = self.conn.get_val('SELECT size FROM blocks WHERE id=?', (id_,))
-                    inode = self.create_inode(mode=stat.S_IFREG | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
-                                              mtime_ns=now_ns, atime_ns=now_ns, ctime_ns=now_ns,
-                                              refcount=1, size=size)
-                    self.conn.execute('INSERT INTO inode_blocks (inode, blockno, block_id) VALUES(?,?,?)',
-                                      (inode, 0, id_))
-                    self.conn.execute("INSERT INTO contents (name_id, inode, parent_inode) VALUES (?,?,?)",
-                                      (self._add_name(basename(name)), inode, id_p))
-                    self.conn.execute("UPDATE blocks SET refcount=? WHERE id=?", (1, id_))
-
-                else:
-                    self.found_errors = True
-                    self.log_error("Block %d has wrong reference count, setting from %d to %d",
-                                   id_, cnt_old, cnt)
-                    self.conn.execute("UPDATE blocks SET refcount=? WHERE id=?", (cnt, id_))
-        finally:
-            self.conn.execute('DROP TABLE refcounts')
-            self.conn.execute('DROP TABLE IF EXISTS wrong_refcounts')
-
-    def check_blocks_checksum(self):
-        """Check blocks.hash"""
-
-        log.info('Checking blocks (checksums)...')
-
-        for (block_id, obj_id) in list(self.conn.query('SELECT id, obj_id FROM blocks '
-                                                       'WHERE hash IS NULL')):
-            self.found_errors = True
-
-            # This should only happen when there was an error during upload,
-            # so the object must not have been stored correctly. We cannot
-            # just recalculate the hash for the block, because then we may
-            # be modifying the contents of the inode that refers to this
-            # block.
-            self.log_error("No checksum for block %d, removing from table...", block_id)
-
-            # At the moment, we support only one block per object
-            assert self.conn.get_val('SELECT refcount FROM objects WHERE id=?',
-                                     (obj_id,)) == 1
-
-            self.conn.execute('DELETE FROM blocks WHERE id=?', (block_id,))
-            self.conn.execute('DELETE FROM objects WHERE id=?', (obj_id,))
+        # This should only happen when there was an error during upload, so the
+        # object must not have been stored correctly. We cannot just recalculate
+        # the hash for the block, because then we may be modifying the contents
+        # of the inode that refers to this block.
+        self.found_errors = True
+        self.log_error("No checksum for %d objects, removing from table...", count)
+        self.conn.execute('DELETE FROM objects WHERE hash IS NULL')
+        
+        # Orphaned objects will be picked up by check_objects_id(), and missing
+        # blocks handled by check_inode_blocks_obj_id().
 
     def create_inode(self, mode, uid=os.getuid(), gid=os.getgid(),
                      mtime_ns=None, atime_ns=None, ctime_ns=None, refcount=None,
@@ -693,10 +650,10 @@ class Fsck(object):
 
             self.conn.execute('''
                CREATE TEMPORARY TABLE wrong_refcounts AS
-               SELECT id, refcounts.refcount, names.refcount
-                 FROM names LEFT JOIN refcounts USING (id)
+               SELECT names.id, refcounts.refcount, names.refcount
+                 FROM names LEFT JOIN refcounts ON %(dbf)snames.id = %(dbf)srefcounts.id
                 WHERE names.refcount != refcounts.refcount
-                   OR refcounts.refcount IS NULL''')
+                   OR %(dbf)srefcounts.refcount IS NULL''' % self.conn.fixes)
 
             for (id_, cnt, cnt_old) in self.conn.query('SELECT * FROM wrong_refcounts'):
                 self.found_errors = True
@@ -799,9 +756,6 @@ class Fsck(object):
                                inode, to_str(get_path(inode, self.conn)))
 
 
-
-
-
         for (name, id_p) in self.conn.query('SELECT name, parent_inode FROM contents_v '
                                             'WHERE LENGTH(name) > 255'):
             path = get_path(id_p, self.conn, name)
@@ -819,20 +773,19 @@ class Fsck(object):
                           '(id INTEGER PRIMARY KEY, refcount INTEGER NOT NULL)')
         try:
             self.conn.execute('INSERT INTO refcounts (id, refcount) '
-                              'SELECT obj_id, COUNT(obj_id) FROM blocks GROUP BY obj_id')
+                              'SELECT obj_id, COUNT(obj_id) FROM inode_blocks GROUP BY obj_id')
 
             self.conn.execute('''
                CREATE TEMPORARY TABLE wrong_refcounts AS
-               SELECT id, refcounts.refcount, objects.refcount
-                 FROM objects LEFT JOIN refcounts USING (id)
+               SELECT objects.id, refcounts.refcount, objects.refcount
+                 FROM objects LEFT JOIN refcounts ON %(dbf)sobjects.id = %(dbf)srefcounts.id
                 WHERE objects.refcount != refcounts.refcount
-                   OR refcounts.refcount IS NULL''')
+                   OR %(dbf)srefcounts.refcount IS NULL''' % self.conn.fixes)
 
             for (id_, cnt, cnt_old) in self.conn.query('SELECT * FROM wrong_refcounts'):
                 if cnt is None and id_ in self.unlinked_objects and cnt_old == 0:
-                    # Object was unlinked by check_block_refcounts
+                    # Object was unlinked by check_cache
                     self.conn.execute('DELETE FROM objects WHERE id=?', (id_,))
-
                 else:
                     self.found_errors = True
                     self.log_error("Object %s has invalid refcount, setting from %d to %d",
@@ -842,7 +795,8 @@ class Fsck(object):
                         self.conn.execute("UPDATE objects SET refcount=? WHERE id=?",
                                           (cnt, id_))
                     else:
-                        # Orphaned object will be picked up by check_keylist
+                        # Orphaned object will be picked up by check_objects_id(), dangling
+                        # references by check_inode_blocks_obj_id()
                         self.conn.execute('DELETE FROM objects WHERE id=?', (id_,))
         finally:
             self.conn.execute('DROP TABLE refcounts')
@@ -869,9 +823,10 @@ class Fsck(object):
         if not isinstance(plain_backend, LocalBackend):
             return
 
-        log.info('Checking for temporary objects (backend)...')
+        log.info('Checking for temporary objects and empty directories (backend)...')
 
-        for (path, dirnames, filenames) in os.walk(plain_backend.prefix, topdown=True):
+        empty_dirs = 0
+        for (path, dirnames, filenames) in os.walk(plain_backend.prefix, topdown=False):
             for name in filenames:
                 if not re.search(r'^[^#]+#[0-9]+--?[0-9]+\.tmp$', name):
                     continue
@@ -879,6 +834,15 @@ class Fsck(object):
                 self.found_errors = True
                 self.log_error("removing temporary file %s", name)
                 os.unlink(os.path.join(path, name))
+                
+            if path != plain_backend.prefix:
+                try:
+                    os.rmdir(path)
+                    empty_dirs += 1
+                except OSError:
+                    pass
+                    
+        log.info('Removed %d empty directories', empty_dirs)
 
     def check_objects_id(self):
         """Check objects.id"""
@@ -933,36 +897,9 @@ class Fsck(object):
 
                 self.found_errors = True
                 self.log_error("object %s only exists in table but not in backend, deleting", obj_id)
-
-                for (id_,) in self.conn.query('SELECT inode FROM inode_blocks JOIN blocks ON block_id = id '
-                                              'WHERE obj_id=? ', (obj_id,)):
-
-                    # Same file may lack several blocks, but we want to move it
-                    # only once
-                    if id_ in self.moved_inodes:
-                        continue
-                    self.moved_inodes.add(id_)
-
-                    # Copy the list, or we may pick up the same entry again and again
-                    # (first from the original location, then from lost+found)
-                    affected_entries = list(self.conn.query('SELECT name, name_id, parent_inode '
-                                                            'FROM contents_v WHERE inode=?', (id_,)))
-                    for (name, name_id, id_p) in affected_entries:
-                        path = get_path(id_p, self.conn, name)
-                        self.log_error("File may lack data, moved to /lost+found: %s", to_str(path))
-                        (_, newname) = self.resolve_free(b"/lost+found", escape(path))
-
-                        self.conn.execute('UPDATE contents SET name_id=?, parent_inode=? '
-                                          'WHERE name_id=? AND parent_inode=?',
-                                          (self._add_name(newname), lof_id, name_id, id_p))
-                        self._del_name(name_id)
-
-                # Unlink missing blocks
-                for (block_id,) in self.conn.query('SELECT id FROM blocks WHERE obj_id=?', (obj_id,)):
-                    self.conn.execute('DELETE FROM inode_blocks WHERE block_id=?', (block_id,))
-
-                self.conn.execute("DELETE FROM blocks WHERE obj_id=?", (obj_id,))
+                # Missing references will be picked up by check_inode_blocks_obj_id() later.
                 self.conn.execute("DELETE FROM objects WHERE id=?", (obj_id,))
+                
         finally:
             if sys.stdout.isatty():
                 sys.stdout.write('\n')
@@ -971,16 +908,16 @@ class Fsck(object):
             self.conn.execute('DROP TABLE IF EXISTS missing')
 
 
-    def check_objects_size(self):
-        """Check objects.size"""
+    def check_objects_phys_size(self):
+        """Check objects.phys_size"""
 
-        log.info('Checking objects (sizes)...')
+        log.info('Checking objects (physical sizes)...')
 
-        for (obj_id,) in self.conn.query('SELECT id FROM objects WHERE size = -1 OR size IS NULL'):
+        for (obj_id,) in self.conn.query(
+            'SELECT id FROM objects WHERE phys_size = -1'):
             self.found_errors = True
             self.log_error("Object %d has no size information, retrieving from backend...", obj_id)
-
-            self.conn.execute('UPDATE objects SET size=? WHERE id=?',
+            self.conn.execute('UPDATE objects SET phys_size=? WHERE id=?',
                               (self.backend.get_size('s3ql_data_%d' % obj_id), obj_id))
 
 
@@ -1040,83 +977,6 @@ class Fsck(object):
         self.conn.execute('DELETE FROM names WHERE refcount=0 AND id=?', (name_id,))
 
 
-class ROFsck(Fsck):
-    '''
-    Check file system database only, and don't correct any errors.
-    '''
-
-    def __init__(self, path):
-
-        db = Connection(path + '.db')
-        db.execute('PRAGMA journal_mode = WAL')
-
-        param = load_params(path)
-        super().__init__(None, None, param, db)
-
-    def check(self):
-
-        self.conn.execute('BEGIN TRANSACTION')
-        try:
-            log.info('Creating temporary indices...')
-            for idx in ('tmp1', 'tmp2', 'tmp3', 'tmp4', 'tmp5'):
-                self.conn.execute('DROP INDEX IF EXISTS %s' % idx)
-            self.conn.execute('CREATE INDEX tmp1 ON blocks(obj_id)')
-            self.conn.execute('CREATE INDEX tmp2 ON inode_blocks(block_id)')
-            self.conn.execute('CREATE INDEX tmp3 ON contents(inode)')
-            self.conn.execute('CREATE INDEX tmp4 ON contents(name_id)')
-            self.conn.execute('CREATE INDEX tmp5 ON ext_attributes(name_id)')
-
-            self.check_lof()
-            self.check_names_refcount()
-
-            self.check_contents_name()
-            self.check_contents_inode()
-            self.check_contents_parent_inode()
-
-            self.check_objects_refcount()
-            self.check_objects_size()
-
-            self.check_blocks_obj_id()
-            self.check_blocks_refcount()
-            self.check_blocks_checksum()
-
-            self.check_inode_blocks_block_id()
-            self.check_inode_blocks_inode()
-
-            self.check_inodes_refcount()
-            self.check_inodes_size()
-
-            self.check_ext_attributes_name()
-            self.check_ext_attributes_inode()
-
-            self.check_symlinks_inode()
-
-            self.check_loops()
-            self.check_unix()
-            self.check_foreign_keys()
-
-        finally:
-            log.info('Dropping temporary indices...')
-            self.conn.execute('ROLLBACK')
-
-    def check_blocks_checksum(self):
-        """Check blocks.hash"""
-
-        log.info('Checking blocks (checksums)...')
-
-        for (block_id,) in self.conn.query('SELECT id FROM blocks WHERE hash IS NULL'):
-            self.found_errors = True
-            self.log_error("No cached checksum for block %d!", block_id)
-
-    def check_objects_size(self):
-        """Check objects.size"""
-
-        log.info('Checking objects (sizes)...')
-
-        for (obj_id,) in self.conn.query('SELECT id FROM objects WHERE size IS NULL'):
-            self.found_errors = True
-            self.log_error("Object %d has no size information!", obj_id)
-
 def parse_args(args):
 
     parser = ArgumentParser(
@@ -1124,17 +984,22 @@ def parse_args(args):
 
     parser.add_log('~/.s3ql/fsck.log')
     parser.add_cachedir()
-    parser.add_authfile()
     parser.add_debug()
     parser.add_quiet()
     parser.add_backend_options()
     parser.add_version()
     parser.add_storage_url()
+    parser.add_compress()
 
+    parser.add_argument("--keep-cache", action="store_true", default=False,
+                      help="Do not purge locally cached files on exit.")
     parser.add_argument("--batch", action="store_true", default=False,
                       help="If user input is required, exit without prompting.")
     parser.add_argument("--force", action="store_true", default=False,
                       help="Force checking even if file system is marked clean.")
+    parser.add_argument("--force-remote", action="store_true", default=False,
+                      help="Force use of remote metadata even when this would "
+                        "likely result in data loss.")
     options = parser.parse_args(args)
 
     return options
@@ -1157,32 +1022,36 @@ def main(args=None):
 
     log.info('Starting fsck of %s', options.storage_url)
 
-    cachepath = get_backend_cachedir(options.storage_url, options.cachedir)
+    cachepath = options.cachepath
     seq_no = get_seq_no(backend)
     db = None
+
+    # When there was a crash during metadata rotation, we may end up
+    # without an s3ql_metadata object.
+    meta_obj_name = 's3ql_metadata'
+    if meta_obj_name not in backend:
+        meta_obj_name += '_new'
 
     if os.path.exists(cachepath + '.params'):
         assert os.path.exists(cachepath + '.db')
         param = load_params(cachepath)
         if param['seq_no'] < seq_no:
             log.info('Ignoring locally cached metadata (outdated).')
-            param = backend.lookup('s3ql_metadata')
+            param = backend.lookup(meta_obj_name)
         else:
             log.info('Using cached metadata.')
             db = Connection(cachepath + '.db')
-            assert not os.path.exists(cachepath + '-cache') or param['needs_fsck']
 
         if param['seq_no'] > seq_no:
             log.warning('File system has not been unmounted cleanly.')
             param['needs_fsck'] = True
 
-        elif backend.lookup('s3ql_metadata')['seq_no'] != param['seq_no']:
+        elif backend.lookup(meta_obj_name)['seq_no'] != param['seq_no']:
             log.warning('Remote metadata is outdated.')
             param['needs_fsck'] = True
 
     else:
-        param = backend.lookup('s3ql_metadata')
-        assert not os.path.exists(cachepath + '-cache')
+        param = backend.lookup(meta_obj_name)
         # .db might exist if mount.s3ql is killed at exactly the right instant
         # and should just be ignored.
 
@@ -1210,27 +1079,17 @@ def main(args=None):
 
         print('Enter "continue, I know what I am doing" to use the outdated data anyway:',
               '> ', sep='\n', end='')
-        if options.batch:
+        if options.force_remote:
+            print('(--force-remote specified, continuing anyway)')
+        elif options.batch:
             raise QuietError('(in batch mode, exiting)', exitcode=41)
-        if sys.stdin.readline().strip() != 'continue, I know what I am doing':
+        elif sys.stdin.readline().strip() != 'continue, I know what I am doing':
             raise QuietError(exitcode=42)
 
         param['seq_no'] = seq_no
         param['needs_fsck'] = True
 
-    if not db and os.path.exists(cachepath + '-cache'):
-        for i in itertools.count():
-            bak_name = '%s-cache.bak%d' % (cachepath, i)
-            if not os.path.exists(bak_name):
-                break
-        log.warning('Found outdated cache directory (%s), renaming to .bak%d',
-                    cachepath + '-cache', i)
-        log.warning('You should delete this directory once you are sure that '
-                    'everything is in order.')
-        os.rename(cachepath + '-cache', bak_name)
-
     if (not param['needs_fsck']
-        and param['max_inode'] < 2 ** 31
         and (time.time() - param['last_fsck'])
              < 60 * 60 * 24 * 31): # last check more than 1 month ago
         if options.force:
@@ -1238,6 +1097,31 @@ def main(args=None):
         else:
             log.info('File system is marked as clean. Use --force to force checking.')
             return
+
+    # When using remote metadata, get rid of outdated local cache (so that we
+    # don't accidentally upload it)
+    outdated_cachedir = False
+    if not db:
+        try:
+            for name_ in os.listdir(cachepath + '-cache'):
+                if name_ not in ('.', '..'):
+                    outdated_cachedir = True
+                    break
+        except FileNotFoundError:
+            pass
+    if outdated_cachedir and param['needs_fsck']:
+        for i in itertools.count():
+            bak_name = '%s-cache.bak%d' % (cachepath, i)
+            if not os.path.exists(bak_name):
+                break
+        log.warning('Renaming outdated cache directory %s to .bak%d',
+                    cachepath + '-cache', i)
+        log.warning('You should delete this directory once you are sure that '
+                    'everything is in order.')
+        os.rename(cachepath + '-cache', bak_name)
+    elif outdated_cachedir:
+        log.info("Flushing outdated local cache...")
+        shutil.rmtree(cachepath + '-cache')
 
     # If using local metadata, check consistency
     if db:
@@ -1256,6 +1140,13 @@ def main(args=None):
     else:
         db = download_metadata(backend, cachepath + '.db')
 
+    # We only read cache files if the filesystem was not
+    # unmounted cleanly. On a clean unmount, the cache files can
+    # not be dirty.
+    check_cache = param['needs_fsck']
+    if check_cache and options.keep_cache:
+        check_cache = 'keep'
+
     # Increase metadata sequence no
     param['seq_no'] += 1
     param['needs_fsck'] = True
@@ -1263,19 +1154,10 @@ def main(args=None):
     save_params(cachepath, param)
 
     fsck = Fsck(cachepath + '-cache', backend, param, db)
-    fsck.check()
-    param['max_inode'] = db.get_val('SELECT MAX(id) FROM inodes')
+    fsck.check(check_cache)
 
     if fsck.uncorrectable_errors:
         raise QuietError("Uncorrectable errors found, aborting.", exitcode=44+128)
-
-    if os.path.exists(cachepath + '-cache'):
-        os.rmdir(cachepath + '-cache')
-
-    if param['max_inode'] >= 2 ** 31:
-        renumber_inodes(db)
-        param['inode_gen'] += 1
-        param['max_inode'] = db.get_val('SELECT MAX(id) FROM inodes')
 
     if fsck.found_errors and not param['needs_fsck']:
         log.error('File system was marked as clean, yet fsck found problems.')
@@ -1299,61 +1181,6 @@ def main(args=None):
         sys.exit(128)
     else:
         sys.exit(0)
-
-def renumber_inodes(db):
-    '''Renumber inodes'''
-
-    log.info('Renumbering inodes...')
-    for table in ('inodes', 'inode_blocks', 'symlink_targets',
-                  'contents', 'names', 'blocks', 'objects', 'ext_attributes'):
-        db.execute('ALTER TABLE %s RENAME TO %s_old' % (table, table))
-
-    for table in ('contents_v', 'ext_attributes_v'):
-        db.execute('DROP VIEW %s' % table)
-
-    create_tables(db)
-    for table in ('names', 'blocks', 'objects'):
-        db.execute('DROP TABLE %s' % table)
-        db.execute('ALTER TABLE %s_old RENAME TO %s' % (table, table))
-
-    log.info('..mapping..')
-    db.execute('CREATE TEMPORARY TABLE inode_map (rowid INTEGER PRIMARY KEY AUTOINCREMENT, id INTEGER UNIQUE)')
-    db.execute('INSERT INTO inode_map (rowid, id) VALUES(?,?)', (ROOT_INODE, ROOT_INODE))
-    db.execute('INSERT INTO inode_map (rowid, id) VALUES(?,?)', (CTRL_INODE, CTRL_INODE))
-    db.execute('INSERT INTO inode_map (id) SELECT id FROM inodes_old WHERE id > ? ORDER BY id ASC',
-               (CTRL_INODE,))
-
-    log.info('..inodes..')
-    db.execute('INSERT INTO inodes (id,mode,uid,gid,mtime_ns,atime_ns,ctime_ns,refcount,size,locked,rdev) '
-               'SELECT (SELECT rowid FROM inode_map WHERE inode_map.id = inodes_old.id), '
-               '       mode,uid,gid,mtime_ns,atime_ns,ctime_ns,refcount,size,locked,rdev FROM inodes_old')
-
-    log.info('..inode_blocks..')
-    db.execute('INSERT INTO inode_blocks (inode, blockno, block_id) '
-               'SELECT (SELECT rowid FROM inode_map WHERE inode_map.id = inode_blocks_old.inode), '
-               '       blockno, block_id FROM inode_blocks_old')
-
-    log.info('..contents..')
-    db.execute('INSERT INTO contents (inode, parent_inode, name_id) '
-               'SELECT (SELECT rowid FROM inode_map WHERE inode_map.id = contents_old.inode), '
-               '       (SELECT rowid FROM inode_map WHERE inode_map.id = contents_old.parent_inode), '
-               '       name_id FROM contents_old')
-
-    log.info('..symlink_targets..')
-    db.execute('INSERT INTO symlink_targets (inode, target) '
-               'SELECT (SELECT rowid FROM inode_map WHERE inode_map.id = symlink_targets_old.inode), '
-               '       target FROM symlink_targets_old')
-
-    log.info('..ext_attributes..')
-    db.execute('INSERT INTO ext_attributes (inode, name_id, value) '
-               'SELECT (SELECT rowid FROM inode_map WHERE inode_map.id = ext_attributes_old.inode), '
-               '       name_id, value FROM ext_attributes_old')
-
-    for table in ('inodes', 'inode_blocks', 'symlink_targets',
-                  'contents', 'ext_attributes'):
-        db.execute('DROP TABLE %s_old' % table)
-
-    db.execute('DROP TABLE inode_map')
 
 
 def escape(path):

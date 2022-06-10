@@ -10,7 +10,7 @@ from .logging import logging, setup_logging
 from . import CTRL_NAME
 from .common import assert_s3ql_mountpoint, parse_literal
 from .parse_args import ArgumentParser
-import llfuse
+import pyfuse3
 import os
 import subprocess
 import platform
@@ -32,6 +32,7 @@ def parse_args(args):
         Unmounts an S3QL file system. The command returns only after all data
         has been uploaded to the backend.'''))
 
+    parser.add_log()
     parser.add_debug()
     parser.add_quiet()
     parser.add_version()
@@ -90,18 +91,26 @@ def get_cmdline(pid):
     and return None.
     '''
 
-    try:
-        output = subprocess.check_output(['ps', '-p', str(pid), '-o', 'args='],
-                                         universal_newlines=True).strip()
-    except subprocess.CalledProcessError:
-        log.warning('Unable to execute ps, assuming process %d has terminated.'
-                    % pid)
-        return None
+    if os.path.isdir('/proc'):
+        try:
+            with open('/proc/%d/cmdline' % pid, 'r') as cmd_file:
+                return cmd_file.read()
 
-    if output:
-        return output
+        except FileNotFoundError:
+            return None
+
     else:
-        return None
+        try:
+            output = subprocess.check_output(['ps', '-p', str(pid), '-o', 'args='],
+                                             universal_newlines=True).strip()
+            if output:
+                return output
+
+        except subprocess.CalledProcessError:
+            log.warning('Error when executing ps, assuming process %d has terminated.'
+                        % pid)
+
+    return None
 
 def blocking_umount(mountpoint):
     '''Invoke fusermount and wait for daemon to terminate.'''
@@ -114,11 +123,11 @@ def blocking_umount(mountpoint):
     ctrlfile = os.path.join(mountpoint, CTRL_NAME)
 
     log.debug('Flushing cache...')
-    llfuse.setxattr(ctrlfile, 's3ql_flushcache!', b'dummy')
+    pyfuse3.setxattr(ctrlfile, 's3ql_flushcache!', b'dummy')
 
     # Get pid
     log.debug('Trying to get pid')
-    pid = parse_literal(llfuse.getxattr(ctrlfile, 's3ql_pid?'), int)
+    pid = parse_literal(pyfuse3.getxattr(ctrlfile, 's3ql_pid?'), int)
     log.debug('PID is %d', pid)
 
     # Get command line to make race conditions less-likely

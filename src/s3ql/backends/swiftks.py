@@ -21,9 +21,12 @@ log = logging.getLogger(__name__)
 
 class Backend(swift.Backend):
 
-    def __init__(self, storage_url, login, password, options):
+    # Add the options for the v3 keystore swift.
+    known_options = swift.Backend.known_options | {'domain', 'project-domain', 'project-domain-is-name', 'domain-is-name', 'tenant-is-name', 'identity-url'}
+
+    def __init__(self, options):
         self.region = None
-        super().__init__(storage_url, login, password, options)
+        super().__init__(options)
 
     @copy_ancestor_docstring
     def _parse_storage_url(self, storage_url, ssl_context):
@@ -76,18 +79,70 @@ class Backend(swift.Backend):
             tenant = None
             user = self.login
 
-        auth_body = { 'auth':
+        # We can optionally configure with tenant name instead of id.
+        tenant_is_name = 'tenant-is-name' in self.options
+
+        # We can configure with domain as id or name.
+        domain = self.options.get('domain', None)
+        domain_is_name = 'domain-is-name' in self.options
+        if domain:
+            if not tenant:
+                raise ValueError("Tenant is required when Keystone v3 is used")
+
+            # In simple cases where there's only one domain, the project domain
+            # will be the same as the authentication domain, but this option
+            # allows for them to be different
+            # We can configure with project-domain as id or name
+            project_domain = self.options.get('project-domain', domain)
+            project_domain_is_name = ('project-domain-is-name' in self.options) or domain_is_name
+
+            auth_body = {
+                'auth': {
+                    'identity': {
+                        'methods': ['password'],
+                        'password': {
+                            'user': {
+                                'name': user,
+                                'domain': {
+                                    ('name' if domain_is_name else 'id'): domain
+                                },
+                                'password': self.password
+                            }
+                        }
+                    },
+                    'scope': {
+                        'project': {
+                            ('name' if tenant_is_name else 'id'): tenant,
+                            'domain': {
+                                ('name' if project_domain_is_name else 'id'): project_domain
+                            }
+                        }
+                    }
+                }
+            }
+
+            if 'identity-url' in self.options:
+                auth_url_path = self.options['identity-url']
+            else:
+                auth_url_path = '/v3/auth/tokens'
+
+        else:
+            # If a domain is not specified, assume v2
+            auth_body = { 'auth':
                           { 'passwordCredentials':
                                 { 'username': user,
                                   'password': self.password } }}
-        if tenant:
-            auth_body['auth']['tenantName'] = tenant
+
+            auth_url_path = '/v2.0/tokens'
+
+            if tenant:
+                auth_body['auth']['tenantName'] = tenant
 
         with HTTPConnection(self.hostname, port=self.port, proxy=self.proxy,
                             ssl_context=ssl_context) as conn:
             conn.timeout = int(self.options.get('tcp-timeout', 20))
 
-            conn.send_request('POST', '/v2.0/tokens', headers=headers,
+            conn.send_request('POST', auth_url_path, headers=headers,
                               body=json.dumps(auth_body).encode('utf-8'))
             resp = conn.read_response()
 
@@ -98,10 +153,16 @@ class Backend(swift.Backend):
                 raise HTTPError(resp.status, resp.reason, resp.headers)
 
             cat = json.loads(conn.read().decode('utf-8'))
-            self.auth_token = cat['access']['token']['id']
+
+            if self.options.get('domain', None) or self.options.get('domain-name', None):
+                self.auth_token = resp.headers['X-Subject-Token']
+                service_catalog = cat['token']['catalog']
+            else:
+                self.auth_token = cat['access']['token']['id']
+                service_catalog = cat['access']['serviceCatalog']
 
         avail_regions = []
-        for service in cat['access']['serviceCatalog']:
+        for service in service_catalog:
             if service['type'] != 'object-store':
                 continue
 
@@ -110,7 +171,17 @@ class Backend(swift.Backend):
                     avail_regions.append(endpoint['region'])
                     continue
 
-                o = urlsplit(endpoint['publicURL'])
+                if 'publicURL' in endpoint:
+                    # The publicURL nomenclature is found in v2 catalogs
+                    o = urlsplit(endpoint['publicURL'])
+                else:
+                    # Whereas v3 catalogs do 'interface' == 'public' and
+                    # 'url' for the URL itself
+                    if endpoint['interface'] != 'public':
+                        continue
+
+                    o = urlsplit(endpoint['url'])
+
                 self.auth_prefix = urllib.parse.unquote(o.path)
                 if o.scheme == 'https':
                     ssl_context = self.ssl_context
@@ -120,7 +191,7 @@ class Backend(swift.Backend):
                     # fall through to scheme used for authentication
                     pass
 
-                self._detect_features(o.hostname, o.port)
+                self._detect_features(o.hostname, o.port, ssl_context)
 
                 conn = HTTPConnection(o.hostname, o.port,  proxy=self.proxy,
                                       ssl_context=ssl_context)

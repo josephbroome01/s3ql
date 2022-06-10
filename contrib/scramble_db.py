@@ -27,7 +27,7 @@ if (os.path.exists(os.path.join(basedir, 'setup.py')) and
 
 from s3ql.logging import logging, setup_logging, QuietError
 from s3ql import CURRENT_FS_REV
-from s3ql.common import get_backend_cachedir, load_params
+from s3ql.common import load_params
 from s3ql.database import Connection
 from s3ql.metadata import dump_metadata
 from s3ql.parse_args import ArgumentParser
@@ -44,6 +44,7 @@ def parse_args(args):
                     "This is intended to preserve privacy when a metadata copy "
                     "needs to be provided to the developers for debugging.")
 
+    parser.add_log()
     parser.add_debug()
     parser.add_quiet()
     parser.add_version()
@@ -63,7 +64,7 @@ def main(args=None):
     setup_logging(options)
 
     # Check for cached metadata
-    cachepath = get_backend_cachedir(options.storage_url, options.cachedir)
+    cachepath = options.cachepath
     if not os.path.exists(cachepath + '.params'):
         raise QuietError("No local metadata found.")
 

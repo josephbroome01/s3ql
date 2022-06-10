@@ -12,34 +12,35 @@ if __name__ == '__main__':
     import sys
     sys.exit(pytest.main([__file__] + sys.argv[1:]))
 
-from s3ql.logging import logging
-import mock_server
-from dugong import ConnectionClosed
-from s3ql import backends, BUFSIZE
-from s3ql.backends.local import Backend as LocalBackend
-from s3ql.backends.gs import Backend as GSBackend
-from s3ql.backends.common import (NoSuchObject, CorruptedObjectError)
-from s3ql.backends.comprenc import ComprencBackend, ObjectNotEncrypted
-from s3ql.backends.s3c import BadDigestError, OperationAbortedError, HTTPError, S3Error
 from argparse import Namespace
 from common import get_remote_test_info, NoTestSection, CLOCK_GRANULARITY
-from pytest_checklogs import assert_logs
-import s3ql.backends.common
-import tempfile
-import re
-import functools
-import time
-import pytest
+from dugong import ConnectionClosed
 from pytest import raises as assert_raises
+from pytest_checklogs import assert_logs
+from s3ql import backends, BUFSIZE
+from s3ql.backends.common import (NoSuchObject, CorruptedObjectError)
+from s3ql.backends.comprenc import ComprencBackend, ObjectNotEncrypted
+from s3ql.backends.gs import Backend as GSBackend
+from s3ql.backends.local import Backend as LocalBackend
+from s3ql.backends.s3c import BadDigestError, OperationAbortedError, HTTPError, S3Error
+from s3ql.backends.swift import Backend as SwiftBackend
+from s3ql.logging import logging
+import functools
+import mock_server
+import pytest
+import re
+import s3ql.backends.common
 import shutil
 import struct
+import tempfile
 import threading
+import time
 
 log = logging.getLogger(__name__)
 empty_set = set()
 
 def brace_expand(s):
-    hit = re.search('^(.*)\{(.+)\}(.*)$', s)
+    hit = re.search(r'^(.*)\{(.+)\}(.*)$', s)
     if not hit:
         return [s]
     (p, e, s) = hit.groups()
@@ -109,11 +110,11 @@ def pytest_generate_tests(metafunc, _info_cache=[]):
     if 'backend' not in metafunc.fixturenames:
         return
 
-    fn = metafunc.function
-    assert hasattr(fn, 'with_backend')
+    with_backend_mark = metafunc.definition.get_closest_marker('with_backend')
+    assert with_backend_mark
 
     test_params = []
-    for spec in fn.with_backend.args:
+    for spec in with_backend_mark.args:
         (backend_spec, comprenc_spec) = spec.split('/')
 
         # Expand compression/encryption specification
@@ -135,10 +136,10 @@ def pytest_generate_tests(metafunc, _info_cache=[]):
                              if x.classname == name ]
 
         # Filter
-        if fn.with_backend.kwargs.get('require_mock_server', False):
+        if with_backend_mark.kwargs.get('require_mock_server', False):
             test_bi = [ x for x in test_bi
                         if 'request_handler' in x ]
-        if fn.with_backend.kwargs.get('require_immediate_consistency', False):
+        if with_backend_mark.kwargs.get('require_immediate_consistency', False):
             test_bi = [ x for x in test_bi
                         if 'request_handler' in x
                         or x.classname in ('local', 'gs') ]
@@ -175,11 +176,12 @@ def backend(request):
             backend = ComprencBackend(None, (comprenc_kind, 6), raw_backend)
 
         backend.unittest_info = raw_backend.unittest_info
+
         yield backend
 
 def yield_local_backend(bi):
     backend_dir = tempfile.mkdtemp(prefix='s3ql-backend-')
-    backend = LocalBackend('local://' + backend_dir, None, None)
+    backend = LocalBackend(Namespace(storage_url='local://' + backend_dir))
     backend.unittest_info = Namespace()
     backend.unittest_info.retry_time = 0
     try:
@@ -197,7 +199,11 @@ def yield_mock_backend(bi):
 
     storage_url = bi.storage_url % { 'host': server.server_address[0],
                                      'port': server.server_address[1] }
-    backend = backend_class(storage_url, 'joe', 'swordfish', { 'no-ssl': True })
+    backend = backend_class(Namespace(
+        storage_url=storage_url,
+        backend_login='joe',
+        backend_password='swordfish',
+        backend_options={ 'no-ssl': True }))
 
     # Enable OAuth when using Google Backend
     if isinstance(backend, GSBackend):
@@ -233,14 +239,17 @@ def yield_remote_backend(bi, _ctr=[0]):
     storage_url += '%d_%d/' % (time.time(), _ctr[0])
 
     backend_class = backends.prefix_map[bi.classname]
-    backend = backend_class(storage_url, bi.login, bi.password, {})
+    backend = backend_class(Namespace(
+        storage_url=storage_url, backend_login=bi.login,
+        backend_password=bi.password, backend_options={}))
 
     backend.unittest_info = Namespace()
     backend.unittest_info.retry_time = 600
     try:
         yield backend
     finally:
-        backend.clear()
+        for name in list(backend.list()):
+            backend.delete(name, force=True)
         backend.close()
 
 def newname(name_counter=[0]):
@@ -456,10 +465,33 @@ def test_delete(backend):
     assert_not_in_index(backend, [key])
     assert_not_readable(backend, key)
 
+@pytest.mark.with_backend('b2/aes')
+def test_delete_b2_versions(backend):
+    key = newname()
+    values = [ newvalue() for _ in range(3) ]
+
+    # Write values to same key, should become versions of the key
+    for value in values:
+        backend[key] = value
+
+    # Wait for it
+    assert_in_index(backend, [key])
+    fetch_object(backend, key)
+
+    # Delete it, should delete all versions
+    del backend[key]
+
+    assert_not_in_index(backend, [key])
+    assert_not_readable(backend, key)
+
+
 # No need to run with different encryption/compression settings,
 # ComprencBackend should just forward this 1:1 to the raw backend.
 @pytest.mark.with_backend('*/aes')
 def test_delete_multi(backend):
+    if not backend.has_delete_multi:
+        pytest.skip('backend does not support delete_multi')
+
     keys = [ newname() for _ in range(30) ]
     value = newvalue()
 
@@ -473,7 +505,7 @@ def test_delete_multi(backend):
         fetch_object(backend, key)
 
     # Delete half of them
-    # We don't use force=True but catch the exemption to increase the
+    # We don't use force=True but catch the exception to increase the
     # chance that some existing objects are not deleted because of the
     # error.
     to_delete = keys[::2]
@@ -485,7 +517,10 @@ def test_delete_multi(backend):
 
     # Without full consistency, deleting an non-existing object
     # may not give an error
-    assert backend.unittest_info.retry_time or len(to_delete) > 0
+    # Swift backend does not return a list of actually deleted objects
+    # so to_delete wil always be empty for Swift and this assertion fails
+    if not isinstance(backend.backend, SwiftBackend):
+        assert backend.unittest_info.retry_time or len(to_delete) > 0
 
     deleted = set(keys[::2]) - set(to_delete)
     assert len(deleted) > 0
@@ -498,29 +533,6 @@ def test_delete_multi(backend):
     assert_in_index(backend, remaining)
     for key in remaining:
         fetch_object(backend, key)
-
-# No need to run with different encryption/compression settings,
-# ComprencBackend should just forward this 1:1 to the raw backend.
-@pytest.mark.with_backend('*/aes')
-def test_clear(backend):
-    keys = [ newname() for _ in range(5) ]
-    value = newvalue()
-
-    # Create objects
-    for key in keys:
-        backend[key] = value
-
-    # Wait for them
-    assert_in_index(backend, keys)
-    for key in keys:
-        fetch_object(backend, key)
-
-    # Delete everything
-    backend.clear()
-
-    assert_not_in_index(backend, keys)
-    for key in keys:
-        assert_not_readable(backend, key)
 
 @pytest.mark.with_backend('*/raw', 'local/{plain,aes,zlib}')
 def test_copy(backend):

@@ -19,6 +19,8 @@ import pytest
 import errno
 import time
 from common import get_remote_test_info, NoTestSection
+from argparse import Namespace
+import signal
 from s3ql.backends import gs
 from s3ql.backends.local import Backend as LocalBackend
 from s3ql.common import get_seq_no
@@ -41,12 +43,15 @@ class TestFailsafe(t4_fuse.TestFuse):
             (backend_login, backend_pw,
              self.storage_url) = get_remote_test_info('gs-test')
         except NoTestSection as exc:
+            super().teardown_method(method)
             pytest.skip(exc.reason)
 
         self.backend_login = backend_login
         self.backend_passphrase = backend_pw
 
-        self.backend = gs.Backend(self.storage_url, backend_login, backend_pw, {})
+        self.backend = gs.Backend(Namespace(
+            storage_url=self.storage_url, backend_login=backend_login,
+            backend_password=backend_pw, backend_options={}))
 
     def test(self):
         self.mkfs(max_obj_size=10*1024**2)
@@ -110,7 +115,7 @@ class TestNewerMetadata(t4_fuse.TestFuse):
         self.mkfs()
 
         # Get backend instance
-        plain_backend = LocalBackend(self.storage_url, None, None)
+        plain_backend = LocalBackend(Namespace(storage_url=self.storage_url))
 
         # Save metadata
         meta = plain_backend['s3ql_metadata']
@@ -150,3 +155,29 @@ class TestNewerMetadata(t4_fuse.TestFuse):
         assert meta == plain_backend['s3ql_metadata']
 
         plain_backend.close()
+
+
+class TestSigInt(t4_fuse.TestFuse):
+    '''
+    Make sure that we gracefully exit on SIGINT
+    '''
+
+    def test(self):
+        self.mkfs()
+
+        # Mount file system
+        self.mount()
+
+        # wait until pyfuse3 main loop runs
+        time.sleep(2)
+
+        # send SIGINT
+        self.mount_process.send_signal(signal.SIGINT)
+
+        # wait for clean unmount
+        self.mount_process.wait(5)
+
+        # we exited successfully?
+        assert self.mount_process.returncode == 0
+
+        self.fsck()

@@ -10,18 +10,6 @@ installed first. The best method to satisfy these dependencies depends
 on your distribution.
 
 
-The following instructions are for S3QL |version| and should be
-applicable to any system. The `S3QL Wiki
-<https://bitbucket.org/nikratio/s3ql/wiki/Home>`_ contains `additional
-help <https://bitbucket.org/nikratio/s3ql/wiki/Installation>`_ help
-for specific distributions and operating systems. Note, however, that
-S3QL wiki is editable by anyone. The information there has thus not
-been vetted by the S3QL maintainers, and may be wrong, out-of-date, or
-even dangerous. Generally, you should only follow steps from the Wiki
-that you fully understand yourself, and fall back on the instructions
-below when in doubt.
-
-
 Dependencies
 ============
 
@@ -30,43 +18,47 @@ running S3QL. Generally, you should first check if your distribution
 already provides a suitable packages and only install from source if
 that is not the case.
 
-* Kernel: Linux 2.6.9 or newer or FreeBSD with `FUSE4BSD
-  <http://www.freshports.org/sysutils/fusefs-kmod/>`_. Starting with
-  kernel 2.6.26 you will get significantly better write performance,
-  so under Linux you should actually use *2.6.26 or newer whenever
-  possible*.
+* Kernel: Linux 3.9 or newer.
 
 * The `psmisc <http://psmisc.sf.net/>`_ utilities.
 
 * `SQLite <http://www.sqlite.org/>`_ version 3.7.0 or newer. SQLite
   has to be installed as a *shared library* with development headers.
 
-* `Python <http://www.python.org/>`_ 3.3.0 or newer. Make sure to also
+* `Python <http://www.python.org/>`_ 3.7 or newer. Make sure to also
   install the development headers.
 
 * The following Python modules:
 
   * `setuptools <https://pypi.python.org/pypi/setuptools>`_, version 1.0 or newer.
-  * `pycrypto <https://www.dlitz.net/software/pycrypto/>`_
+  * `cryptography <https://cryptography.io/en/latest/installation/>`_
   * `defusedxml <https://pypi.python.org/pypi/defusedxml/>`_
-  * `requests <https://pypi.python.org/pypi/requests/>`_ (optional,
-    required for OAuth2 authentication with Google Storage)
-  * `systemd <https://github.com/systemd/python-systemd>`_ (optional,
-    for enabling systemd support).
   * `apsw <https://github.com/rogerbinns/apsw>`_, version 3.7.0 or
     newer.
-  * `llfuse <https://bitbucket.org/nikratio/python-llfuse/>`_, any
-    version between 1.0 (inclusive) and 2.0 (exclusive)
-  * `dugong <https://bitbucket.org/nikratio/python-dugong/>`_, any
+  * `trio <https://github.com/python-trio/trio>`_, version 0.15 or newer.
+  * `pyfuse3 <https://github.com/libfuse/pyfuse3/>`_, any
+    version between 3.2.0 (inclusive) and 4.0 (exclusive)
+  * `dugong <https://pypi.org/project/dugong/>`_, any
     version between 3.4 (inclusive) and 4.0 (exclusive)
-  * `pytest <http://pytest.org/>`_, version 2.7 or newer (optional, to run unit tests)
-  * `pytest-catchlog <https://github.com/eisensheng/pytest-catchlog>`_
-    (optional, to run unit tests)
+  * `pytest <http://pytest.org/>`_, version 3.7 or newer (optional, to run unit tests)
+  * `async_generator <https://pypi.org/project/async_generator/>`_
+    (not needed when using Python 3.7 or newer)
+  * `systemd <https://github.com/systemd/python-systemd>`_ (optional,
+    for enabling systemd support). Do *not* install the module from
+    PyPi, this is from a third-party developer and incompatible with
+    the official module from the systemd developers.
+  * `requests <https://pypi.python.org/pypi/requests/>`_ (optional,
+    required for OAuth2 authentication with Google Storage)
+  * `google-auth <https://pypi.python.org/project/google-auth/>`_
+    (optional, required for ADC authentication with Google Storage)
+  * `google-auth-oauthlib <https://pypi.python.org/project/google-auth-oauthlib/>`_
+    (optional, required for browser-based authentication with Google Storage)
+  * `pytest_trio <https://github.com/python-trio/pytest-trio>`_ (optional, to run unit tests)
 
   To check if a specific module :var:`<module>` is installed, execute
   :samp:`python3 -c 'import {<module>};
   print({<module>}.__version__)'`. This will result in an
-  `ImportError` if the module is not installed, and will print the
+  `ModuleNotFoundError` if the module is not installed, and will print the
   installed version if the module is installed.
 
 
@@ -77,13 +69,13 @@ Installing S3QL
 
 To build and install S3QL itself, proceed as follows:
 
-1. Download S3QL from https://bitbucket.org/nikratio/s3ql/downloads
+1. Download S3QL from https://github.com/s3ql/s3ql/releases
 2. Unpack it into a folder of your choice
 3. Run `python3 setup.py build_ext --inplace` to build S3QL.
 4. Run `python3 -m pytest tests/` to run a self-test. If this fails, ask
    for help on the `mailing list
    <http://groups.google.com/group/s3ql>`_ or report a bug in the
-   `issue tracker <https://bitbucket.org/nikratio/s3ql/issues>`_.
+   `issue tracker <https://github.com/s3ql/s3ql/issues>`_.
 
 Now you have three options:
 
@@ -103,7 +95,7 @@ Development Version
 If you have checked out the unstable development version from the
 Mercurial repository, a bit more effort is required. You'll also need:
 
-* Version 0.24 or newer of the Cython_ compiler.
+* Version 0.28.1 or newer of the Cython_ compiler.
 
 * Version 1.2b1 or newer of the Sphinx_ document processor.
 
@@ -112,7 +104,7 @@ tested with ::
 
   python3 setup.py build_cython
   python3 setup.py build_ext --inplace
-  python3 -m pytest tests/
+  python3 -m pytest tests
 
 Note that when building from the Mercurial or Git repository, building
 and testing is done with several additional checks. This may cause
@@ -125,7 +117,8 @@ behave as it does for a regular release.
 
 The HTML and PDF documentation can be generated with ::
 
-  python3 setup.py build_sphinx
+  ./build_docs.sh
+  (cd doc/pdf && make)
 
 and S3QL can be installed as usual with ::
 

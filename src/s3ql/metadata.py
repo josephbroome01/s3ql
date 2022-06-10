@@ -22,14 +22,10 @@ log = logging.getLogger(__name__)
 # Has to be kept in sync with create_tables()!
 DUMP_SPEC = [
              ('objects', 'id', (('id', INTEGER, 1),
-                                ('size', INTEGER),
-                                ('refcount', INTEGER))),
-
-             ('blocks', 'id', (('id', INTEGER, 1),
-                             ('hash', BLOB, 32),
-                             ('size', INTEGER),
-                             ('obj_id', INTEGER, 1),
-                             ('refcount', INTEGER))),
+                                ('hash', BLOB, 32),
+                                ('refcount', INTEGER),
+                                ('phys_size', INTEGER),
+                                ('length', INTEGER))),
 
              ('inodes', 'id', (('id', INTEGER, 1),
                                ('uid', INTEGER),
@@ -46,7 +42,7 @@ DUMP_SPEC = [
              ('inode_blocks', 'inode, blockno',
               (('inode', INTEGER),
                ('blockno', INTEGER, 1),
-               ('block_id', INTEGER, 1))),
+               ('obj_id', INTEGER, 1))),
 
              ('symlink_targets', 'inode', (('inode', INTEGER, 1),
                                            ('target', BLOB))),
@@ -124,16 +120,19 @@ def cycle_metadata(backend, keep=10):
         except NoSuchObject:
             pass
 
-    # However, the current metadata object should always be copied,
-    # so that even if there's a crash we don't end up without it
+    # If we use backend.rename() and crash right after this instruction,
+    # we will end up without an s3ql_metadata object. However, fsck.s3ql
+    # is smart enough to use s3ql_metadata_new in this case.
     try:
-        backend.copy("s3ql_metadata", "s3ql_metadata_bak_0")
+        cycle_fn("s3ql_metadata", "s3ql_metadata_bak_0")
     except NoSuchObject:
         # In case of mkfs, there may be no metadata object yet
         pass
     cycle_fn("s3ql_metadata_new", "s3ql_metadata")
 
-    if cycle_fn is backend.copy:
+    # Note that we can't compare with "is" (maybe because the bound-method
+    # is re-created on the fly on access?)
+    if cycle_fn == backend.copy:
         backend.delete('s3ql_metadata_new')
 
 def dump_metadata(db, fh):
@@ -161,23 +160,16 @@ def dump_metadata(db, fh):
 def create_tables(conn):
     # Table of storage objects
     # Refcount is included for performance reasons
-    # size == -1 indicates block has not been uploaded yet
+    # phys_size is the number of bytes stored in the backend (i.e., after compression).
+    # length is the logical size in the filesystem.
+    # phys_size == -1 indicates block has not been uploaded yet
     conn.execute("""
     CREATE TABLE objects (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        refcount  INT NOT NULL,
-        size      INT NOT NULL
-    )""")
-
-    # Table of known data blocks
-    # Refcount is included for performance reasons
-    conn.execute("""
-    CREATE TABLE blocks (
-        id        INTEGER PRIMARY KEY,
-        hash      BLOB(16) UNIQUE,
-        refcount  INT,
-        size      INT NOT NULL,
-        obj_id    INTEGER NOT NULL REFERENCES objects(id)
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash        BLOB(32) UNIQUE,
+        refcount    INT NOT NULL,
+        phys_size   INT NOT NULL,
+        length      INT NOT NULL
     )""")
 
     # Table with filesystem metadata
@@ -207,7 +199,7 @@ def create_tables(conn):
     CREATE TABLE inode_blocks (
         inode     INTEGER NOT NULL REFERENCES inodes(id),
         blockno   INT NOT NULL,
-        block_id    INTEGER NOT NULL REFERENCES blocks(id),
+        obj_id    INTEGER NOT NULL REFERENCES objects(id),
         PRIMARY KEY (inode, blockno)
     )""")
 

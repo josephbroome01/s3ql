@@ -8,7 +8,7 @@ This work can be distributed under the terms of the GNU GPLv3.
 
 from .logging import logging # Ensure use of custom logger class
 from .database import NoSuchRowError
-import llfuse
+import pyfuse3
 import sys
 
 log = logging.getLogger(__name__)
@@ -21,8 +21,6 @@ UPDATE_ATTRS = ('mode', 'refcount', 'uid', 'gid', 'size', 'locked',
               'rdev', 'atime_ns', 'mtime_ns', 'ctime_ns')
 UPDATE_STR = ', '.join('%s=?' % x for x in UPDATE_ATTRS)
 
-MAX_INODE = 2 ** 32 - 1
-
 class _Inode:
     '''An inode with its attributes'''
 
@@ -34,7 +32,7 @@ class _Inode:
         self.generation = generation
 
     def entry_attributes(self):
-        attr = llfuse.EntryAttributes()
+        attr = pyfuse3.EntryAttributes()
         attr.st_nlink = self.refcount
         attr.st_blocks = (self.size + 511) // 512
         attr.st_ino = self.id
@@ -197,10 +195,6 @@ class InodeCache(object):
 
         id_ = self.db.rowid('INSERT INTO inodes (%s) VALUES(%s)' % (columns, values),
                             bindings)
-        if id_ > MAX_INODE - 1:
-            self.db.execute('DELETE FROM inodes WHERE id=?', (id_,))
-            raise OutOfInodesError()
-
         return self[id_]
 
 
@@ -218,6 +212,8 @@ class InodeCache(object):
 
     def destroy(self):
         '''Flush all entries and empty cache'''
+
+        # Note: this method is currently also used for dropping the cache
 
         for i in range(len(self.cached_rows)):
             id_ = self.cached_rows[i]
@@ -250,6 +246,11 @@ class InodeCache(object):
                 else:
                     self.setattr(inode)
 
+    def drop(self):
+        '''Drop cache (after flushing)'''
+
+        self.destroy()
+
     def __del__(self):
         if len(self.attrs) == 0:
             return
@@ -262,10 +263,3 @@ class InodeCache(object):
             exc_info = sys.exc_info()
 
         sys.excepthook(*exc_info)
-
-
-
-class OutOfInodesError(Exception):
-
-    def __str__(self):
-        return 'Could not find free rowid in inode table'

@@ -9,9 +9,8 @@ This work can be distributed under the terms of the GNU GPLv3.
 from ..logging import logging, QuietError # Ensure use of custom logger class
 from .. import BUFSIZE
 from .common import (AbstractBackend, NoSuchObject, retry, AuthorizationError,
-                     AuthenticationError, DanglingStorageURLError, retry_generator,
-                     get_proxy, get_ssl_context, CorruptedObjectError,
-                     checksum_basic_mapping)
+                     AuthenticationError, DanglingStorageURLError, get_proxy,
+                     get_ssl_context, CorruptedObjectError, checksum_basic_mapping)
 from ..inherit_docstrings import (copy_ancestor_docstring, prepend_ancestor_docstring,
                                   ABCDocstMeta)
 from io import BytesIO
@@ -39,6 +38,7 @@ C_MONTH_NAMES = [ 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep',
 
 XML_CONTENT_RE = re.compile(r'^(?:application|text)/xml(?:;|$)', re.IGNORECASE)
 
+
 log = logging.getLogger(__name__)
 
 class Backend(AbstractBackend, metaclass=ABCDocstMeta):
@@ -52,7 +52,7 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
     known_options = {'no-ssl', 'ssl-ca-path', 'tcp-timeout',
                      'dumb-copy', 'disable-expect100'}
 
-    def __init__(self, storage_url, login, password, options):
+    def __init__(self, options):
         '''Initialize backend object
 
         *ssl_context* may be a `ssl.SSLContext` instance or *None*.
@@ -60,23 +60,24 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
 
         super().__init__()
 
-        if 'no-ssl' in options:
+        if 'no-ssl' in options.backend_options:
             self.ssl_context = None
         else:
-            self.ssl_context = get_ssl_context(options.get('ssl-ca-path', None))
+            self.ssl_context = get_ssl_context(
+                options.backend_options.get('ssl-ca-path', None))
 
-        (host, port, bucket_name, prefix) = self._parse_storage_url(storage_url,
-                                                                    self.ssl_context)
+        (host, port, bucket_name, prefix) = self._parse_storage_url(
+            options.storage_url, self.ssl_context)
 
-        self.options = options
+        self.options = options.backend_options
         self.bucket_name = bucket_name
         self.prefix = prefix
         self.hostname = host
         self.port = port
         self.proxy = get_proxy(self.ssl_context is not None)
         self.conn = self._get_conn()
-        self.password = password
-        self.login = login
+        self.password = options.backend_password
+        self.login = options.backend_login
 
     @property
     @copy_ancestor_docstring
@@ -127,24 +128,21 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         conn.timeout = int(self.options.get('tcp-timeout', 20))
         return conn
 
-    @staticmethod
-    def _tag_xmlns_uri(elem):
-        '''Extract the XML namespace (xmlns) URI from an element'''
-        if elem.tag[0] == '{':
-            uri, ignore, tag = elem.tag[1:].partition("}")
-        else:
-            uri = None
-        return uri
-
     # This method is also used implicitly for the retry handling of
     # `gs.Backend._get_access_token`. When modifying this method, do not forget
     # to check if this makes it unsuitable for use by `_get_access_token` (in
     # that case we will have to implement a custom retry logic there).
     @copy_ancestor_docstring
     def is_temp_failure(self, exc): #IGNORE:W0613
+        if is_temp_network_error(exc) or isinstance(exc, ssl.SSLError):
+            # We probably can't use the connection anymore, so use this
+            # opportunity to reset it
+            self.conn.reset()
+
         if isinstance(exc, (InternalError, BadDigestError, IncompleteBodyError,
                             RequestTimeoutError, OperationAbortedError,
-                            SlowDownError, ServiceUnavailableError)):
+                            SlowDownError, ServiceUnavailableError,
+                            TemporarilyUnavailableError)):
             return True
 
         elif is_temp_network_error(exc):
@@ -154,19 +152,19 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         # codes where retry is definitely not desired. For 4xx (client error) we
         # do not retry in general, but for 408 (Request Timeout) RFC 2616
         # specifies that the client may repeat the request without
-        # modifications.
+        # modifications. We also retry on 429 (Too Many Requests).
         elif (isinstance(exc, HTTPError) and
               ((500 <= exc.status <= 599
                 and exc.status not in (501,505,508,510,511,523))
-               or exc.status == 408)):
+               or exc.status in (408,429))):
             return True
 
-        # Temporary workaround for
-        # https://bitbucket.org/nikratio/s3ql/issues/87 and
-        # https://bitbucket.org/nikratio/s3ql/issues/252
-        elif (isinstance(exc, ssl.SSLError) and
-              (str(exc).startswith('[SSL: BAD_WRITE_RETRY]') or
-               str(exc).startswith('[SSL: BAD_LENGTH]'))):
+        # Consider all SSL errors as temporary. There are a lot of bug
+        # reports from people where various SSL errors cause a crash
+        # but are actually just temporary. On the other hand, we have
+        # no information if this ever revealed a problem where retrying
+        # was not the right choice.
+        elif isinstance(exc, ssl.SSLError):
             return True
 
         return False
@@ -226,74 +224,60 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
             else:
                 raise NoSuchObject(key)
 
-    @retry_generator
     @copy_ancestor_docstring
-    def list(self, prefix='', start_after=''):
-        log.debug('started with %s, %s', prefix, start_after)
-
-        keys_remaining = True
-
-        # Without this, a call to list('foo') would result
-        # in *prefix* being longer than *marker* - which causes
-        # trouble for some S3 implementions (minio).
-        if start_after:
-            marker = self.prefix + start_after
-        else:
-            marker = ''
+    def list(self, prefix=''):
         prefix = self.prefix + prefix
-
-        while keys_remaining:
-            log.debug('requesting with marker=%s', marker)
-
-            keys_remaining = None
-            resp = self._do_request('GET', '/', query_string={ 'prefix': prefix,
-                                                              'marker': marker,
-                                                              'max-keys': 1000 })
-
-            if not XML_CONTENT_RE.match(resp.headers['Content-Type']):
-                raise RuntimeError('unexpected content type: %s' %
-                                   resp.headers['Content-Type'])
-
-            try:
-                itree = iter(ElementTree.iterparse(self.conn, events=("start", "end")))
-                (event, root) = next(itree)
-
-                root_xmlns_uri = self._tag_xmlns_uri(root)
-                if root_xmlns_uri is None:
-                    root_xmlns_prefix = ''
-                else:
-                    # Validate the XML namespace
-                    root_xmlns_prefix = '{%s}' % (root_xmlns_uri, )
-                    if root_xmlns_prefix != self.xml_ns_prefix:
-                        log.error('Unexpected server reply to list operation:\n%s',
-                                  self._dump_response(resp, body=None))
-                        raise RuntimeError('List response has %s as root tag, unknown namespace' % root.tag)
-
-                for (event, el) in itree:
-                    if event != 'end':
-                        continue
-
-                    if el.tag == root_xmlns_prefix + 'IsTruncated':
-                        keys_remaining = (el.text == 'true')
-
-                    elif el.tag == root_xmlns_prefix + 'Contents':
-                        marker = el.findtext(root_xmlns_prefix + 'Key')
-                        yield marker[len(self.prefix):]
-                        root.clear()
-
-            except Exception as exc:
-                if is_temp_network_error(exc) or isinstance(exc, ssl.SSLError):
-                    # We probably can't use the connection anymore
-                    self.conn.disconnect()
-                raise
-
-            except GeneratorExit:
-                # Need to read rest of response
-                self.conn.discard()
+        strip = len(self.prefix)
+        page_token = None
+        while True:
+            (els, page_token) = self._list_page(prefix, page_token)
+            for el in els:
+                yield el[strip:]
+            if page_token is None:
                 break
 
-            if keys_remaining is None:
-                raise RuntimeError('Could not parse body')
+    @retry
+    def _list_page(self, prefix, page_token=None, batch_size=1000):
+
+        # We can get at most 1000 keys at a time, so there's no need
+        # to bother with streaming.
+        query_string = { 'prefix': prefix, 'max-keys': str(batch_size) }
+        if page_token:
+            query_string['marker'] = page_token
+
+        resp = self._do_request('GET', '/', query_string=query_string)
+
+        if not XML_CONTENT_RE.match(resp.headers['Content-Type']):
+            raise RuntimeError('unexpected content type: %s' %
+                               resp.headers['Content-Type'])
+
+        body = self.conn.readall()
+        etree = ElementTree.fromstring(body)
+        root_xmlns_uri = _tag_xmlns_uri(etree)
+        if root_xmlns_uri is None:
+            root_xmlns_prefix = ''
+        else:
+            # Validate the XML namespace
+            root_xmlns_prefix = '{%s}' % (root_xmlns_uri, )
+            if root_xmlns_prefix != self.xml_ns_prefix:
+                log.error('Unexpected server reply to list operation:\n%s',
+                          self._dump_response(resp, body=body))
+                raise RuntimeError('List response has unknown namespace')
+
+        names = [ x.findtext(root_xmlns_prefix + 'Key')
+                  for x in etree.findall(root_xmlns_prefix + 'Contents') ]
+
+        is_truncated = etree.find(root_xmlns_prefix + 'IsTruncated')
+        if is_truncated.text == 'false':
+            page_token = None
+        elif len(names) == 0:
+            next_marker = etree.find(root_xmlns_prefix + 'NextMarker')
+            page_token = next_marker.text
+        else:
+            page_token = names[-1]
+
+        return (names, page_token)
+
 
     @retry
     @copy_ancestor_docstring
@@ -563,7 +547,7 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
             raise HTTPError(resp.status, resp.reason, resp.headers)
 
         # If not XML, do the best we can
-        if not XML_CONTENT_RE.match(content_type) or resp.length == 0:
+        if content_type is None or resp.length == 0 or not XML_CONTENT_RE.match(content_type):
             self.conn.discard()
             raise HTTPError(resp.status, resp.reason, resp.headers)
 
@@ -606,25 +590,6 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
             raise
 
         return tree
-
-    # NOTE: ! This function is also used by the swift backend. !
-    @prepend_ancestor_docstring
-    def clear(self):
-        """
-        This method may not be able to see (and therefore also not delete)
-        recently uploaded objects.
-        """
-
-        # We have to cache keys, because otherwise we can't use the
-        # http connection to delete keys.
-        for (no, s3key) in enumerate(list(self)):
-            if no != 0 and no % 1000 == 0:
-                log.info('clear(): deleted %d objects so far..', no)
-
-            log.debug('started with %s', s3key)
-
-            # Ignore missing objects when clearing bucket
-            self.delete(s3key, True)
 
     def __str__(self):
         return 's3c://%s/%s/%s' % (self.hostname, self.bucket_name, self.prefix)
@@ -704,45 +669,38 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
             return resp
 
         use_expect_100c = not self.options.get('disable-expect100', False)
-        try:
-            log.debug('sending %s %s', method, path)
-            if body is None or isinstance(body, (bytes, bytearray, memoryview)):
-                self.conn.send_request(method, path, body=body, headers=headers)
-            else:
-                body_len = os.fstat(body.fileno()).st_size
-                self.conn.send_request(method, path, expect100=use_expect_100c,
-                                       headers=headers, body=BodyFollowing(body_len))
+        log.debug('sending %s %s', method, path)
+        if body is None or isinstance(body, (bytes, bytearray, memoryview)):
+            self.conn.send_request(method, path, body=body, headers=headers)
+        else:
+            body_len = os.fstat(body.fileno()).st_size
+            self.conn.send_request(method, path, expect100=use_expect_100c,
+                                   headers=headers, body=BodyFollowing(body_len))
 
-                if use_expect_100c:
-                    resp = read_response()
-                    if resp.status != 100: # Error
-                        return resp
+            if use_expect_100c:
+                resp = read_response()
+                if resp.status != 100: # Error
+                    return resp
 
+            try:
+                copyfileobj(body, self.conn, BUFSIZE)
+            except ConnectionClosed:
+                # Server closed connection while we were writing body data -
+                # but we may still be able to read an error response
                 try:
-                    copyfileobj(body, self.conn, BUFSIZE)
-                except ConnectionClosed:
-                    # Server closed connection while we were writing body data -
-                    # but we may still be able to read an error response
-                    try:
-                        resp = read_response()
-                    except ConnectionClosed: # No server response available
-                        pass
-                    else:
-                        if resp.status >= 400: # Got error response
-                            return resp
-                        log.warning('Server broke connection during upload, but signaled '
-                                    '%d %s', resp.status, resp.reason)
+                    resp = read_response()
+                except ConnectionClosed: # No server response available
+                    pass
+                else:
+                    if resp.status >= 400: # Got error response
+                        return resp
+                    log.warning('Server broke connection during upload, but signaled '
+                                '%d %s', resp.status, resp.reason)
 
-                    # Re-raise first ConnectionClosed exception
-                    raise
+                # Re-raise first ConnectionClosed exception
+                raise
 
-            return read_response()
-
-        except Exception as exc:
-            if is_temp_network_error(exc) or isinstance(exc, ssl.SSLError):
-                # We probably can't use the connection anymore
-                self.conn.disconnect()
-            raise
+        return read_response()
 
     @copy_ancestor_docstring
     def close(self):
@@ -787,9 +745,27 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         md5 = b64encode(checksum_basic_mapping(meta)).decode('ascii')
         if md5 != resp.headers.get('%smeta-md5' % self.hdr_prefix, None):
             log.warning('MD5 mismatch in metadata for %s', obj_key)
+
+            # When trying to read file system revision 23 or earlier, we will
+            # get a MD5 error because the checksum was calculated
+            # differently. In order to get a better error message, we special
+            # case the s3ql_passphrase and s3ql_metadata object (which are only
+            # retrieved once at program start).
+            if obj_key in ('s3ql_passphrase', 's3ql_metadata'):
+                raise CorruptedObjectError('Meta MD5 for %s does not match' % obj_key)
             raise BadDigestError('BadDigest', 'Meta MD5 for %s does not match' % obj_key)
 
         return meta
+
+
+def _tag_xmlns_uri(elem):
+    '''Extract the XML namespace (xmlns) URI from an element'''
+    if elem.tag[0] == '{':
+        uri, ignore, tag = elem.tag[1:].partition("}")
+    else:
+        uri = None
+    return uri
+
 
 class ObjectR(object):
     '''An S3 object open for reading'''
@@ -987,9 +963,10 @@ def _parse_retry_after(header):
             return None
         val = mktime_tz(*date) - time.time()
 
-    if val > 300 or val < 0:
-        log.warning('Ignoring retry-after value of %.3f s, using 1 s instead', val)
-        val = 1
+    val_clamp = min(300, max(1, val))
+    if val != val_clamp:
+        log.warning('Ignoring retry-after value of %.3f s, using %.3f s instead', val, val_clamp)
+        val = val_clamp
 
     return val
 
@@ -1045,5 +1022,6 @@ class OperationAbortedError(S3Error): pass
 class RequestTimeoutError(S3Error): pass
 class SlowDownError(S3Error): pass
 class ServiceUnavailableError(S3Error): pass
+class TemporarilyUnavailableError(S3Error): pass
 class RequestTimeTooSkewedError(S3Error): pass
 class NoSuchBucketError(S3Error, DanglingStorageURLError): pass

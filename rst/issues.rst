@@ -17,11 +17,9 @@ Known Issues
   size of 4 kB) is therefore not recommended. Being exceptionally
   unlucky may also be a disadvantage.
 
-* S3QL does not support Access Control Lists (ACLs). This is due to a
-  bug in the FUSE library and will therefore hopefully be fixed at
-  some point. See `issue #16
-  <https://bitbucket.org/nikratio/s3ql/issue/16/support-access-control-lists-acls>`_
-  for more details.
+* S3QL does not support Access Control Lists (ACLs). There is nothing
+  fundamentally that prevents this, someone just has to write the
+  necessary code.
 
 * As of Linux kernel 3.5 S3QL file systems do not implement the "write
   protect" bit on directories. In other words, even if a directory has
@@ -31,24 +29,6 @@ Known Issues
   (cf. https://github.com/libfuse/libfuse/issues/23) and needs to be
   fixed in the kernel.  Unfortunately it does not look as if this is
   going to be fixed anytime soon (as of 2016/2/28).
-
-* S3QL is rather slow when an application tries to write data in
-  unreasonably small chunks. If a 1 MiB file is copied in chunks of 1
-  KB, this will take more than 10 times as long as when it's copied
-  with the (recommended) chunk size of 128 KiB.
-
-  This is a limitation of the FUSE library (which does not yet support
-  write caching) which will hopefully be addressed in some future FUSE
-  version.
-
-  Most applications, including e.g. GNU `cp` and `rsync`, use
-  reasonably large buffers and are therefore not affected by this
-  problem and perform very efficient on S3QL file systems.
-
-  However, if you encounter unexpectedly slow performance with a
-  specific program, this might be due to the program using very small
-  write buffers. Although this is not really a bug in the program,
-  it might be worth to ask the program's authors for help.
 
 * S3QL always updates file and directory access times as if the ``relatime``
   mount option has been specified: the access time ("atime") is only updated
@@ -69,14 +49,13 @@ Known Issues
   bug has already been fixed in recent find versions.
 
 * The `umount` and `fusermount -u` commands will *not* block until all
-  data has been uploaded to the backend. (this is a FUSE limitation
-  that will hopefully be removed in the future, see `issue #1
-  <https://bitbucket.org/nikratio/s3ql/issue/1/blocking-fusermount-and-umount>`_). If
-  you use either command to unmount an S3QL file system, you have to
-  take care to explicitly wait for the `mount.s3ql` process to
-  terminate before you shut down or restart the system. Therefore it
-  is generally not a good idea to mount an S3QL file system in
-  `/etc/fstab` (you should use a dedicated init script instead).
+  data has been uploaded to the backend. (this is a FUSE limitation,
+  cf. https://github.com/libfuse/libfuse/issues/1). If you use either
+  command to unmount an S3QL file system, you have to take care to
+  explicitly wait for the `mount.s3ql` process to terminate before you
+  shut down or restart the system. Therefore it is generally not a
+  good idea to mount an S3QL file system in `/etc/fstab` (you should
+  use a dedicated init script instead).
 
 * S3QL relies on the backends not to run out of space. This is a given
   for big storage providers like Amazon S3 or Google Storage, but you

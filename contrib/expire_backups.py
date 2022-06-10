@@ -12,7 +12,6 @@ import os
 import re
 import textwrap
 import shutil
-import pickle
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -52,6 +51,7 @@ def parse_args(args):
         '''))
 
     parser.add_quiet()
+    parser.add_log()
     parser.add_debug()
     parser.add_version()
 
@@ -65,6 +65,8 @@ def parse_args(args):
                         help='File to save state information in (default: "%(default)s")')
     parser.add_argument("-n", action="store_true", default=False,
                         help="Dry run. Just show which backups would be deleted.")
+    parser.add_argument("-p", "--proportion-delete", type=float, default=0.5, metavar="<N>",
+            help='Maximum proportion of backups to delete (between 0 and 1, default: %(default)s)')
     parser.add_argument('--reconstruct-state', action='store_true', default=False,
                         help='Try to reconstruct a missing state file from backup dates.')
 
@@ -75,6 +77,9 @@ def parse_args(args):
 
     if sorted(options.cycles) != options.cycles:
         parser.error('Age range boundaries must be in increasing order')
+
+    if not (0<options.proportion_delete<=1):
+        parser.error('Proportion of backups to delete must be between 0 and 1')
 
     return options
 
@@ -110,6 +115,9 @@ def main(args=None):
 
     to_delete = process_backups(backup_list, state, options.cycles)
 
+    if len(backup_list) and (len(to_delete)/len(backup_list) > options.proportion_delete):
+        raise QuietError('Would remove more than %d%% of backups, aborting' % (options.proportion_delete*100))
+
     for x in to_delete:
         log.info('Backup %s is no longer needed, removing...', x)
         if not options.n:
@@ -122,8 +130,11 @@ def main(args=None):
         log.info('Dry run, not saving state.')
     else:
         log.info('Saving state..')
-        with open(options.state, 'wb') as fh:
+        with open(options.state + '.new', 'wb') as fh:
             fh.write(freeze_basic_mapping(state))
+        if os.path.exists(options.state):
+            os.rename(options.state, options.state + '.bak')
+        os.rename(options.state + '.new', options.state)
 
 def upgrade_to_state(backup_list):
     log.info('Several existing backups detected, trying to convert absolute ages to cycles')
@@ -149,23 +160,6 @@ def upgrade_to_state(backup_list):
 
     log.info('State construction complete.')
     return state
-
-def simulate(args):
-
-    options = parse_args(args)
-    setup_logging(options)
-
-    state = dict()
-    backup_list = set()
-    for i in range(50):
-        backup_list.add('backup-%2d' % i)
-        delete = process_backups(backup_list, state, options.cycles)
-        log.info('Deleting %s', delete)
-        backup_list -= delete
-
-        log.info('Available backups on day %d:', i)
-        for x in sorted(backup_list):
-            log.info(x)
 
 def process_backups(backup_list, state, cycles):
 
@@ -284,5 +278,4 @@ def format_list(l):
 
 
 if __name__ == '__main__':
-    #simulate(sys.argv[1:])
     main(sys.argv[1:])

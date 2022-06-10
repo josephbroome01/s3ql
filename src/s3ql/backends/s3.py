@@ -36,13 +36,13 @@ class Backend(s3c.Backend):
     may or may not be available and can be queried for with instance methods.
     """
 
-    known_options = ((s3c.Backend.known_options | { 'sse', 'rrs', 'ia' })
+    known_options = ((s3c.Backend.known_options | {'sse', 'rrs', 'ia', 'oia', 'it'})
                      - {'dumb-copy', 'disable-expect100'})
 
-    def __init__(self, storage_url, login, password, options):
+    def __init__(self, options):
         self.region = None
         self.signing_key = None
-        super().__init__(storage_url, login, password, options)
+        super().__init__(options)
 
     def _parse_storage_url(self, storage_url, ssl_context):
         hit = re.match(r'^s3s?://([^/]+)/([^/]+)(?:/(.*))?$', storage_url)
@@ -56,10 +56,10 @@ class Backend(s3c.Backend):
         if not re.match('^[a-z0-9][a-z0-9.-]{1,60}[a-z0-9]$', bucket_name):
             raise QuietError('Invalid bucket name.', exitcode=2)
 
-        if self.region == 'us-east-1':
-            hostname = 's3.amazonaws.com'
+        if self.region.startswith('cn-'):
+            hostname = 's3.%s.amazonaws.com.cn' % self.region
         else:
-            hostname = 's3-%s.amazonaws.com' % self.region
+            hostname = 's3.%s.amazonaws.com' % self.region
 
         prefix = hit.group(3) or ''
         port = 443 if ssl_context else 80
@@ -67,6 +67,11 @@ class Backend(s3c.Backend):
 
     def __str__(self):
         return 'Amazon S3 bucket %s, prefix %s' % (self.bucket_name, self.prefix)
+
+    @property
+    @copy_ancestor_docstring
+    def has_delete_multi(self):
+        return True
 
     @copy_ancestor_docstring
     def delete_multi(self, keys, force=False):
@@ -84,9 +89,13 @@ class Backend(s3c.Backend):
             headers['x-amz-server-side-encryption'] = 'AES256'
 
         if 'ia' in self.options:
-            sc =  'STANDARD_IA'
+            sc = 'STANDARD_IA'
+        elif 'oia' in self.options:
+            sc = 'ONEZONE_IA'
         elif 'rrs' in self.options:
             sc = 'REDUCED_REDUNDANCY'
+        elif 'it' in self.options:
+            sc = 'INTELLIGENT_TIERING'
         else:
             sc = 'STANDARD'
         headers['x-amz-storage-class'] = sc
@@ -141,17 +150,13 @@ class Backend(s3c.Backend):
                               errtag.findtext(ns_p + 'Key')[offset:],
                               errtag.findtext(ns_p + 'Code'))
 
-            # If *force*, just modify the passed list and return without
-            # raising an exception, otherwise raise exception for the first error
-            if force:
-                return
-
             errcode = error_tags[0].findtext(ns_p + 'Code')
             errmsg = error_tags[0].findtext(ns_p + 'Message')
             errkey = error_tags[0].findtext(ns_p + 'Key')[offset:]
 
             if errcode == 'NoSuchKeyError':
-                raise NoSuchObject(errkey)
+                if not force:
+                    raise NoSuchObject(errkey)
             else:
                 raise get_S3Error(errcode, 'Error deleting %s: %s' % (errkey, errmsg))
 
@@ -179,11 +184,12 @@ class Backend(s3c.Backend):
         auth_strs.append(urllib.parse.quote(path))
 
         if query_string:
-            s = urllib.parse.urlencode(query_string, doseq=True).split('&')
+            s = urllib.parse.urlencode(query_string, doseq=True,
+                                       quote_via=urllib.parse.quote).split('&')
         else:
             s = []
         if subres:
-            s.append(urllib.parse.quote_plus(subres) + '=')
+            s.append(urllib.parse.quote(subres) + '=')
         if s:
             s = '&'.join(sorted(s))
         else:

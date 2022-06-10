@@ -96,12 +96,33 @@ Cache Flushing and Expiration
 -----------------------------
 
 S3QL flushes changed blocks in the cache to the backend whenever a block
-has not been accessed for at least 10 seconds. Note that when a block is
-flushed, it still remains in the cache.
+has not been accessed for at least 10 seconds by default. This time can
+be influenced using the :cmdopt:`--dirty-block-upload-delay` option. Note
+that when a block is flushed, it still remains in the cache.
 
 Cache expiration (i.e., removal of blocks from the cache) is only done
 when the maximum cache size is reached. S3QL always expires the least
 recently used blocks first.
+
+NFS Support
+===========
+
+S3QL filesystems can be exported over NFS. The :cmdopt:`--nfs` option
+is recommended to improve performance when NFS is used, but no harm
+will occur when it is not specified.
+
+NFS supports persistence of client mounts across server restarts. This
+means that if a client has mounted an S3QL file system over NFS, the
+server may unmount and remount the S3QL filesystem (or even reboot)
+without the client being affected beyond temporarily becoming
+unavailable. This poses several challenges, but is supported by S3QL
+as long as no `fsck.s3ql` operation is run:
+
+.. WARNING::
+
+   If `fsck.s3ql` modifies a file system in any way, all NFS
+   clients must unmount and re-mount the NFS share before the
+   S3QL file system is re-mounted on the server.
 
 
 Failure Modes
@@ -157,7 +178,8 @@ Automatic Mounting
 If you want to mount and umount an S3QL file system automatically at
 system startup and shutdown, you should do so with a dedicated S3QL
 init job (instead of using :file:`/etc/fstab`. When using systemd,
-:program:`mount.s3ql` can be run as a service of type ``notify``.
+:program:`mount.s3ql` can be started with :cmdopt:`--systemd` to run
+as a systemd service of type ``notify``.
 
 .. NOTE::
 
@@ -168,8 +190,7 @@ init job (instead of using :file:`/etc/fstab`. When using systemd,
    * file systems mounted in :file:`/etc/fstab` will be unmounted with the
      :program:`umount` command, so your system will not wait until all data has
      been uploaded but shutdown (or restart) immediately (this is a
-     FUSE limitation, see `issue #1
-     <https://bitbucket.org/nikratio/s3ql/issue/1/blocking-fusermount-and-umount>`_).
+     FUSE limitation, cf https://github.com/libfuse/libfuse/issues/1).
 
    * There is no way to tell the system that mounting S3QL requires a
      Python interpreter to be available, so it may attempt to run

@@ -9,7 +9,7 @@ This work can be distributed under the terms of the GNU GPLv3.
 from .logging import logging, setup_logging, QuietError
 from .common import assert_fs_owner
 from .parse_args import ArgumentParser
-import llfuse
+import pyfuse3
 import os
 import stat
 import sys
@@ -32,6 +32,7 @@ def parse_args(args):
         additional storage space.
         '''))
 
+    parser.add_log()
     parser.add_debug()
     parser.add_quiet()
     parser.add_version()
@@ -84,9 +85,16 @@ def main(args=None):
     except PermissionError:
         raise QuietError('No permission to create target directory')
 
-    fstat_t = os.stat(options.target)
-    llfuse.setxattr(ctrlfile, 'copy',
-                    ('(%d, %d)' % (fstat_s.st_ino, fstat_t.st_ino)).encode())
+    # Make sure that write cache is flushed
+    pyfuse3.syncfs(options.target)
+
+    # Ensure the inode of the target folder stays in the kernel dentry cache
+    # (We invalidate it during the copy)
+    with os.scandir(options.target) as it:
+
+        fstat_t = os.stat(options.target)
+        pyfuse3.setxattr(ctrlfile, 'copy',
+                         ('(%d, %d)' % (fstat_s.st_ino, fstat_t.st_ino)).encode())
 
 if __name__ == '__main__':
     main(sys.argv[1:])

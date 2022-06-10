@@ -1,3 +1,384 @@
+2022-06-10, S3QL 4.0.0
+
+  * The internal file system revision has changed. File systems created with this version
+    of S3QL are NOT COMPATIBLE with prior S3QL versions.
+
+    Existing file systems must be upgraded before they can be used with current
+    S3QL versions. This procedure is NOT REVERSIBLE.
+
+    To update an existing file system, use the `s3qladm upgrade` command. This upgrade
+    process updates only the metadata tables and should not take more than a few minutes.
+
+  * Smaller database size and improved performance on metadata operations.
+
+    S3QL was designed to be able to store multiple blocks in the same backend
+    object. However, this feature was never implemented. The necessary abstraction layer
+    has now been removed, which should increase performance and reduce database size.
+
+  * Workarounds for bugs in sqlite 3.38.0 – 3.38.4.
+
+    Sqlite 3.38 introduced bloom filter optimizations. The first patch releases of sqlite 3.38
+    had some bugs that prevented fsck.s3ql from running properly and made it corrupt the database.
+
+  * Fix handling of rate-limits and responses without Content-Type header
+
+    Some Non-Amazon S3 providers return HTTP 429 when rate-limiting.
+    Additionally, error responses may occasionally come without a Content-Type header.
+    These are now handled, no longer causing file system crashes.
+
+
+  * This is the last release from the current maintainer. S3QL is now no longer maintained
+    or developed. Github issue tracking and pull reuests have therefore been disabled. The
+    mailing list continuens to be available for use.
+
+    If you would like to take over this project, you are welcome to do so. Please fork it
+    and develop the fork for a while. Once there has been 6 months of reasonable activity,
+    please contact Nikolaus@rath.org and I'll be happy to give you ownership of this
+    repository or replace with a pointer to the fork.
+
+
+2022-01-10, S3QL 3.8.1
+
+  * Update fsck.s3ql to remove empty direcrtories from local backend's storage
+    directory.  As blocks are added subdirectories are created
+    on demand so there are not too many blocks in each directory, but as blocks
+    are removed from storage empty directories are not automatically removed.
+    The number of empty directories can become quite large over
+    time, slowing down mount.s3ql a little and fsck.s3ql considerably.
+
+  * Fix for fsck.s3ql removing .tmp files in cache directory.
+
+  * Fix bug that would cause incorrect size to be recorded for a block
+    if the file had zero-bytes added to the end by using truncate followed
+    by close.  (The recorded size does not count the zero bytes.)  Both rsync's
+    -S (sparse) option and VirtualBox do this for example. No data corruption,
+    but contrib/fixup_block_sizes.py should be run to fix this.
+
+  * contrib/fix_block_sizes.py updated to check all block sizes, not just
+    ones with size multiple of 512, so it detects blocks affected by the above
+    bug.
+
+2021-11-07, S3QL 3.8.0
+
+  * The way to build the documentation has changed. Instead of running
+    `setup.py build_sphinx`, run `./build_docs.sh`. To generate PDF
+    documentation, follow this with `cd doc/pdf && make`.
+
+  * The `s3ql_verify` tool is now able to detect the kind of corruption that
+    was introduced by the fsck.s3ql data corruption bug described below.
+
+  * The new contrib/fixup_block_sizes.py tool is now available to fix most of
+    the issues caused by the fsck.s3ql bug described below.
+
+2021-06-03, S3QL 3.7.3
+
+  * Fixed a DATA CORRUPTION bug in fsck.s3ql that caused the recorded size of uploaded
+    dirty blocks to be rounded up to the next multiple of 512 bytes, effectively appending
+    up to 512 zero-bytes to the end of affected files.
+
+    This problem was introduced in version 3.4.1 (released 2020-05-08) as part of a
+    seemingly very minor improvement to cache usage calculation.
+
+    You can tell that a file has (likely) been affected from fsck.s3ql messages of the
+    form:
+
+    WARNING: Writing dirty block <X> of inode <Y>
+
+    followed later by:
+
+    WARNING: Size of inode <Y> (<path_to_file>) does not agree with number of blocks, \
+    setting from <reasonable_size> to <size rounded to next multiple of 512)
+
+
+2021-05-04, S3QL 3.7.2
+
+  * Fixed a crash with `dugong.StateError` in the Google Storage backend when the
+    authentication token expires in the middle of an upload.
+
+  * S3QL is now compatible with setuptools >= 47.
+
+
+2021-03-07, S3QL 3.7.1
+
+  * The tcp-timeout backend option of the B2 Backend works now.
+
+  * mount.s3ql no longer crashes with "No Upload Threads available" when not running in
+    foreground.
+
+
+2021-01-03, S3QL 3.7.0
+
+  * S3QL now requires Python 3.7 or newer.
+
+  * S3QL now requires pyfuse3 of any version between 3.2.0 (inclusive) and 4.0 (exclusive).
+
+  * S3QL now supports newer AWS S3 regions like eu-south-1.
+
+  * mount.s3ql now again includes debugging information in its log output when
+    encountering an unexpected exception. This was broken in version 3.4.0, resulting in
+    mount.s3ql seemingly terminating at random in such a situation.
+
+  * mount.s3ql now properly handles SIGTERM (instead of crashing). This means it exits as
+    quickly as possible without data corruption. For a proper unmount, always use
+    `umount.s3ql`, `umount`, or `fusermount -u` and wait for the mount.s3ql process to
+    terminate.
+
+  * More robust expired auth token detection for Google Storage.
+
+
+2020-11-09, S3QL 3.6.0
+
+  * Added ability to specify domain-name, project-domain-name and tenant-name as options
+    for the OpenStack Swift (Keystone v3) backend for providers that prefer name to id.
+
+  * The open() syscall supports the O_TRUNC flag now.
+
+  * `mount.s3ql` now exits gracefully on CTRL-C (INT signal)
+
+  * `mount.s3ql` now supports the `--dirty-block-upload-delay` option to influence the
+    time before dirty blocks are written from the cache to the storage backend.
+
+2020-09-04, S3QL 3.5.1
+
+  * `s3qlctrl upload-meta` now works properly again (previously, only the first
+    invocation had an effect).
+
+  * The O_TRUNC flag of the open() syscall is no longer silently ignored, but
+    the open() call fails with ENOTSUP. A proper implementation will hopefully
+    follow soon.
+
+
+2020-07-15, S3QL 3.5.0
+
+  * S3QL now requires version 3.x rather than 1.x of the pyfuse3 module.
+
+  * Triggering a metadata upload (either through ``s3qlctrl upload-meta`` or the
+    ``--metadata-upload-interval``) works again (since release 3.4.0, this would continue
+    to upload metadata continuously after the first trigger).
+
+  * There is new backend for accessing Backblaze B2.
+
+2020-05-08, S3QL 3.4.1
+
+  * Fixed mount.s3ql "NoneType can't be used in 'await' expression" crash.
+
+
+2020-03-19, S3QL 3.4.0
+
+  * There have been significant changes in the internal implementation. Asynchronous I/O
+    is now used in favor of threads in many places, and libfuse 3.x is used instead of
+    libfuse 2.x.
+
+  * S3QL is now uses kernel-side writeback caching, which should significantly improve
+    write performance for small block sizes.
+
+  * The dependency on the llfuse Python module has been dropped. A dependency on the `trio
+    <https://github.com/python-trio/trio`_ and `pyfuse3
+    <https://github.com/libfuse/pyfuse3/>`_ modules has been added instead.
+
+
+2019-10-20, S3QL 3.3.2
+
+  * Fixed occasional crashes with "KeyError" when using Google Storage
+    backend.
+
+  * Switched to semantic versioning. An increase in the major (first) version number will
+    indicate a backwards incompatible change (eg a change in the file system revision), a
+    change in the minor version (the second element) indicates new features, and a change
+    in the third element indicates bugfixes.
+
+2019-09-08, S3QL 3.3
+
+  * Added support for Keystone V3 authentication.
+
+2019-07-17, S3QL 3.2
+
+  * Added a `--compress` option to `fsck.s3ql`.
+
+  * Minor improvements/fixes to `contrib/benchmark.py`.
+
+  * Added support for INTELLIGENT_TIERING storage class to the S3
+    backend.
+
+2019-03-31, S3QL 3.1
+
+  * Added a new `--fs-name` option to `mount.s3ql` allowing users
+    to specify a name for the fuse mount (This name is visible
+    in the first column of the system `mount` command output).
+
+  * Added support for "Onezone-IA" to the S3 backend.
+
+  * The `s3ql_oauth_client` command is working again now (it was
+    broken due to changes in Google's OAuth2 workflow).
+
+  * Fixed refresh of Google Storage authentication tokens (expired
+    tokens were resulting in crashes).
+
+2019-02-09, S3QL 3.0
+
+  * Added a new `--systemd` option to simplify running mount.s3ql
+    as a systemd unit.
+
+  * Dropped the `--upstart` option - upstart seems to be unused and
+    unmaintained.
+
+  * Dropped support for legacy ("API key") authentication for Google
+    Storage. Only oauth2 is supported now. This was necessitated by
+    the switch to Google's native API (before S3QL was using Google's
+    S3 compatibility layer).
+
+  * Command line options specified in the authinfo file (in particular
+    --backend-options) are now parsed correctly.
+
+  * S3QL now uses python-cryptography instead of the (no longer
+    maintained) pycrypto module.
+
+  * The Google Storage backend now supports Application Default
+    Credentials (ADC). To use this, install the google.auth module
+    and use ``adc`` as your backend login.
+
+  * `umount.s3ql` now works correctly on systems where `ps` doesn't
+    accept a `-p` option (as long as /proc is available).
+
+2018-12-28, S3QL 2.33
+
+  * Fixed a sporadic test failure in t5_cache.py.
+
+2018-11-06, S3QL 2.32
+
+  * Fixed a potential bug in s3qlrm that would probably lead to a
+    filesystem crash (hasn't actually been observed though).
+
+  * Clarified installation instructions: S3QL requires the official
+    systemd Python module, not the (third-party) module on PyPi.
+
+  * Fixed occasional crashes with a "dugong.StateError" exception.
+    Thanks to Roger Gammans for extensive testing!
+
+  * mount.s3ql and fsck.s3ql got a new `--keep-cache` option. If this
+    is specified, locally cached data will not be removed on unmount
+    (or after fsck) so that it can be re-used if the file system is
+    mounted again on the same system without having been mounted
+    elsewhere.
+
+  * S3QL now considers all SSL-related errors as temporary and
+    automatically retries (instead of bailing out).
+
+2018-10-08, S3QL 2.31
+
+  * Object removal now makes more use of parallelism.
+
+2018-09-02, S3QL 2.30
+
+  * s3qladm has gained a new "recover-key" operation to restore the
+    file system passphrase from an offline copy.
+
+  * Error messages in a few situations have been improved.
+
+  * Re-generated C files with Cython 0.28.5 - this may fix some
+    compile problems under Python 3.7.
+
+2018-07-21, S3QL 2.29
+
+  * Removal of files that have not yet been uploaded to the backend is
+    now faster, with less data being uploaded only to be removed
+    shortly after.
+
+  * Clarified NFS support in documentation.
+
+  * contrib/clone_fs.py is now working again.
+
+2018-06-14, S3QL 2.28
+
+  * Fixed upgrade process for unencrypted filesystems (was broken in
+    2.27 and 2.27.1).
+
+  * mount.s3ql now checks /proc/mounts to determine if a storage url
+    is already mounted rather than just relying on flags in the
+    backend.
+
+  * Fixed a busy loop, where mount.s3ql would perform normally but
+    consume much more CPU than needed.
+
+  * Temporary SQLite files are now placed in --cachedir rather
+    than the system temp folder (typically /tmp).
+
+2018-06-09, S3QL 2.27.1
+
+  * Fixed a test failure in tests/t1_dump.py
+
+2018-06-09, S3QL 2.27
+
+  * The internal file system revision has changed. File systems
+    created with S3QL 2.27 or newer are not compatible with prior S3QL
+    versions.
+
+    To update an existing file system to the newest revision, use the
+    's3qladm upgrade' command. During the upgrade, the metadata for
+    all storage objects needs to be updated (so this may take a
+    while).
+
+  * fsck.s3ql is now able to recover blocks that were in transit
+    during a file system crash.
+
+  * Command line options that are common to all S3QL commands that
+    accept a storage URL (e.g. ``--cachedir`` or
+    ``--backend-options``) may now also been specified in the
+    *authinfo2* file by omitting the two leading dashes.
+
+  * Fixed a data corruption issue when mount.s3ql is terminated
+    without being able to clean up (e.g. due to SIGKILL or the
+    computer being power cycled).
+
+  * [SECURITY] Fixed a security vulnerability in the validation of object
+    metadata. All past versions of S3QL are affected by a replay
+    attack where a malicious person in control of the backend is able
+    to present old versions of the filesystem metadata database as
+    up-to-date.
+
+    This could be used to e.g. make deleted files appear
+    again (though attempting to read them would result in an error),
+    or make newly created files appear to have vanished.
+
+    Furthermore, an attacker could freely to set the "needs-fsck"
+    flag, the filesystem revison number, and filesystem block
+    size. Manipulating the filesystem revision number would result in
+    most S3QL commands refusing to work, attempting to upgrade the
+    revision with s3qladm would likely result in errors. Manipulating
+    the block size would result in mount.s3ql silently presenting file
+    incorrect file contents (despite the files being intact in the
+    backend): if the block size is increased, mount.s3ql will insert
+    regularly spaced gaps of zero-bytes. If the blocksize is
+    decreased, mount.s3ql will "cut out" regularly spaced windows of
+    data.
+
+2018-03-04, S3QL 2.26
+
+  * Added support for py.test 3.3.0
+  * Improved metadata rotation performance.
+
+2018-01-05, S3QL 2.25
+
+  * s3qlctrl now accepts a new *dropcache* command.
+  * Fixed a race condition that resulted in mount.s3ql crashing with
+    "I/O operation on closed file". Thanks to www.imCode.com for
+    sponsoring this work!
+
+2017-11-04, S3QL 2.24
+
+  * fsck.s3ql now accepts a new --force-remote parameter. It does
+    dangerous things, and you should probably not use it.
+
+  * When terminated by a signal (rather than by an unmount call),
+    mount.s3ql now terminates as quickly as possible (i.e., without
+    cleaning the cache), resulting in an unclean unmount.
+
+  * The Swift backend feature detection is no longer affected by the
+    no-ssl backend option (which is intended only for connections to
+    the authentication server).
+
+  * Accessing the cn-north-1 S3 storage region is now working.
+
 2017-08-18, S3QL 2.23
 
   * Accessing the us-east-1 S3 storage region is now working again.

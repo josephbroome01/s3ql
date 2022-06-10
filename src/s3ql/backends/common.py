@@ -174,74 +174,6 @@ def extend_docstring(fun, s):
                                for line in textwrap.wrap(s, width=80 - indent))
     fun.__doc__ += '\n'
 
-class RetryIterator:
-    '''
-    A RetryIterator instance iterates over the elements produced by any
-    generator function passed to its constructor, i.e. it wraps the iterator
-    obtained by calling the generator function.  When retrieving elements from the
-    wrapped iterator, exceptions may occur. Most such exceptions are
-    propagated. However, exceptions for which the *is_temp_failure_fn* function
-    returns True are caught. If that happens, the wrapped iterator is replaced
-    by a new one obtained by calling the generator function again with the
-    *start_after* parameter set to the last element that was retrieved before
-    the exception occured.
-
-    If attempts to retrieve the next element fail repeatedly, the iterator is
-    replaced only after sleeping for increasing intervals. If no new element can
-    be obtained after `RETRY_TIMEOUT` seconds, the last exception is no longer
-    caught but propagated to the caller. This behavior is implemented by
-    wrapping the __next__ method with the `retry` decorator.
-    '''
-
-    def __init__(self, generator, is_temp_failure_fn, args=(), kwargs=None):
-        if not inspect.isgeneratorfunction(generator):
-            raise TypeError('*generator* must be generator function')
-
-        self.generator = generator
-        self.iterator = None
-        self.is_temp_failure = is_temp_failure_fn
-        if kwargs is None:
-            kwargs = {}
-        self.kwargs = kwargs
-        self.args = args
-
-    def __iter__(self):
-        return self
-
-    @retry
-    def __next__(self):
-        if self.iterator is None:
-            self.iterator = self.generator(*self.args, **self.kwargs)
-
-        try:
-            el = next(self.iterator)
-        except Exception as exc:
-            if self.is_temp_failure(exc):
-                self.iterator = None
-            raise
-
-        self.kwargs['start_after'] = el
-        return el
-
-def retry_generator(method):
-    '''Wrap *method* in a `RetryIterator`
-
-    *method* must return a generator, and accept a keyword argument
-    *start_with*. The RetryIterator's `is_temp_failure` attribute
-    will be set to the `is_temp_failure` method of the instance
-    to which *method* is bound.
-    '''
-
-    @wraps(method)
-    def wrapped(*a, **kw):
-        return RetryIterator(method, a[0].is_temp_failure, args=a, kwargs=kw)
-
-    extend_docstring(wrapped,
-                     'This generator method has been wrapped and will return a '
-                     '`RetryIterator` instance.')
-
-    return wrapped
-
 class AbstractBackend(object, metaclass=ABCMeta):
     '''Functionality shared between all backends.
 
@@ -288,7 +220,14 @@ class AbstractBackend(object, metaclass=ABCMeta):
     @abstractmethod
     def has_native_rename(self):
         '''True if the backend has a native, atomic rename operation'''
+
         pass
+
+    @property
+    def has_delete_multi(self):
+        '''True if the backend supports `delete_multi`.'''
+
+        return False
 
     def reset(self):
         '''Reset backend
@@ -429,11 +368,6 @@ class AbstractBackend(object, metaclass=ABCMeta):
 
         pass
 
-    @abstractmethod
-    def clear(self):
-        """Delete all objects in backend"""
-        pass
-
     def contains(self, key):
         '''Check if `key` is in backend'''
 
@@ -468,17 +402,7 @@ class AbstractBackend(object, metaclass=ABCMeta):
         error.
         """
 
-        if not isinstance(keys, list):
-            raise TypeError('*keys* parameter must be a list')
-
-        for (i, key) in enumerate(keys):
-            try:
-                self.delete(key, force=force)
-            except:
-                del keys[:i]
-                raise
-
-        del keys[:]
+        raise NotImplemented()
 
     @abstractmethod
     def list(self, prefix=''):
@@ -645,7 +569,7 @@ def get_proxy(ssl):
             proxy_port = 80
 
         proxy_host = hit.group(2)
-        log.info('Using CONNECT proxy %s:%d', proxy_host, proxy_port,
+        log.info('Using proxy %s:%d', proxy_host, proxy_port,
                  extra=LOG_ONCE)
         proxy = (proxy_host, proxy_port)
     else:
@@ -693,7 +617,7 @@ def checksum_basic_mapping(metadata, key=None):
             val = b'\0d' + struct.pack('<d', val)
         elif isinstance(val, (bytes, bytearray)):
             assert len(val).bit_length() <= 32
-            val = b'\0b' + struct.pack('<I', len(val))
+            chk.update(b'\0b' + struct.pack('<I', len(val)))
         else:
             raise ValueError("Don't know how to checksum %s instances" % type(val))
         chk.update(val)

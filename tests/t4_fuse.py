@@ -15,9 +15,9 @@ if __name__ == '__main__':
 from os.path import basename
 from s3ql import CTRL_NAME
 from s3ql.common import path2bytes
-from common import retry, skip_if_no_fusermount
+from common import retry, skip_if_no_fusermount, RetryTimeoutError
 import filecmp
-import llfuse
+import pyfuse3
 import os.path
 import shutil
 import platform
@@ -30,7 +30,7 @@ from pytest import raises as assert_raises
 # For debugging
 USE_VALGRIND = False
 
-@pytest.mark.usefixtures('s3ql_cmd_argv', 'pass_reg_output')
+@pytest.mark.usefixtures('pass_s3ql_cmd_argv', 'pass_reg_output')
 class TestFuse:
 
     def setup_method(self, method):
@@ -76,11 +76,14 @@ class TestFuse:
         self.reg_output(r'^WARNING: Maximum object sizes less than '
                         '1 MiB will degrade performance\.$', count=1)
 
-    def mount(self, expect_fail=None):
+    def mount(self, expect_fail=None, in_foreground = True, extra_args=[]):
         cmd = (self.s3ql_cmd_argv('mount.s3ql') +
-               ["--fg", '--cachedir', self.cache_dir, '--log', 'none',
+               ['--cachedir', self.cache_dir, '--log', 'none',
                 '--compress', 'zlib', '--quiet', self.storage_url, self.mnt_dir,
                 '--authfile', '/dev/null' ])
+        if in_foreground:
+            cmd += ["--fg"]
+        cmd += extra_args
         self.mount_process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                               universal_newlines=True)
         if self.backend_login is not None:
@@ -91,14 +94,14 @@ class TestFuse:
         self.mount_process.stdin.close()
 
         if expect_fail:
-            retry(30, self.mount_process.poll)
+            retry(10, self.mount_process.poll)
             assert self.mount_process.returncode == expect_fail
         else:
             def poll():
                 if os.path.ismount(self.mnt_dir):
                     return True
                 assert self.mount_process.poll() is None
-            retry(30, poll)
+            retry(10, poll)
 
     def umount(self):
         with open('/dev/null', 'wb') as devnull:
@@ -107,53 +110,53 @@ class TestFuse:
 
         proc = subprocess.Popen(self.s3ql_cmd_argv('umount.s3ql') +
                                 ['--quiet', self.mnt_dir])
-        retry(90, lambda : proc.poll() is not None)
+        retry(30, lambda : proc.poll() is not None)
         assert proc.wait() == 0
 
         assert self.mount_process.poll() == 0
         assert not os.path.ismount(self.mnt_dir)
 
-    def fsck(self):
-        # Use fsck to test authinfo reading
-        with tempfile.NamedTemporaryFile('wt') as authinfo_fh:
-            print('[entry1]',
-                  'storage-url: %s' % self.storage_url[:6],
-                  'fs-passphrase: clearly wrong',
-                  'backend-login: bla',
-                  'backend-password: not much better',
-                  '',
-                  '[entry2]',
-                  'storage-url: %s' % self.storage_url,
-                  'fs-passphrase: %s' % self.passphrase,
-                  'backend-login: %s' % self.backend_login,
-                  'backend-password:%s' % self.backend_passphrase,
-                  file=authinfo_fh, sep='\n')
-            authinfo_fh.flush()
+    def fsck(self, expect_retcode=0, args=[]):
+        proc = subprocess.Popen(self.s3ql_cmd_argv('fsck.s3ql') +
+                                [ '--force', '--quiet', '--log', 'none', '--cachedir',
+                                  self.cache_dir, '--authfile', '/dev/null',
+                                  self.storage_url ] + args,
+                                stdin=subprocess.PIPE, universal_newlines=True)
+        if self.backend_login is not None:
+            print(self.backend_login, file=proc.stdin)
+            print(self.backend_passphrase, file=proc.stdin)
+        if self.passphrase is not None:
+            print(self.passphrase, file=proc.stdin)
+        proc.stdin.close()
+        assert proc.wait() == expect_retcode
 
-            proc = subprocess.Popen(self.s3ql_cmd_argv('fsck.s3ql') +
-                                    [ '--force', '--quiet', '--log', 'none', '--cachedir',
-                                      self.cache_dir, '--authfile',
-                                      authinfo_fh.name, self.storage_url ],
-                                    stdin=subprocess.PIPE, universal_newlines=True)
-            proc.stdin.close()
-            assert proc.wait() == 0
-
-    def teardown_method(self, method):
+    def umount_fuse(self):
         with open('/dev/null', 'wb') as devnull:
             if platform.system() == 'Darwin':
                 subprocess.call(['umount', '-l', self.mnt_dir], stderr=devnull)
             else:
                 subprocess.call(['fusermount', '-z', '-u', self.mnt_dir],
                                 stderr=devnull)
+
+    def flush_cache(self):
+        subprocess.check_call(self.s3ql_cmd_argv('s3qlctrl') +
+                              [ '--quiet', 'flushcache', self.mnt_dir ])
+
+
+    def teardown_method(self, method):
+        self.umount_fuse()
         os.rmdir(self.mnt_dir)
 
         # Give mount process a little while to terminate
         if self.mount_process is not None:
             try:
-                retry(90, lambda : self.mount_process.poll() is not None)
+                retry(10, lambda : self.mount_process.poll() is not None)
             except TimeoutError:
-                # Ignore errors  during teardown
-                pass
+                self.mount_process.terminate()
+                try:
+                    self.mount_process.wait(1)
+                except subprocess.TimeoutExpired:
+                    self.mount_process.kill()
 
         shutil.rmtree(self.cache_dir)
         shutil.rmtree(self.backend_dir)
@@ -178,6 +181,17 @@ class TestFuse:
         self.umount()
         self.fsck()
 
+        # Test metadata recovery
+        shutil.rmtree(self.cache_dir)
+        self.cache_dir = tempfile.mkdtemp(prefix='s3ql-cache-')
+        self.fsck()
+
+        shutil.rmtree(self.cache_dir)
+        self.cache_dir = tempfile.mkdtemp(prefix='s3ql-cache-')
+        self.mount()
+        self.umount()
+
+
     def newname(self):
         self.name_cnt += 1
         return "s3ql_%d" % self.name_cnt
@@ -188,12 +202,12 @@ class TestFuse:
         os.mkdir(fullname)
         fstat = os.stat(fullname)
         assert stat.S_ISDIR(fstat.st_mode)
-        assert llfuse.listdir(fullname) ==  []
+        assert pyfuse3.listdir(fullname) ==  []
         assert fstat.st_nlink == 1
-        assert dirname in llfuse.listdir(self.mnt_dir)
+        assert dirname in pyfuse3.listdir(self.mnt_dir)
         os.rmdir(fullname)
         assert_raises(FileNotFoundError, os.stat, fullname)
-        assert dirname not in llfuse.listdir(self.mnt_dir)
+        assert dirname not in pyfuse3.listdir(self.mnt_dir)
 
     def tst_symlink(self):
         linkname = self.newname()
@@ -203,10 +217,10 @@ class TestFuse:
         assert stat.S_ISLNK(fstat.st_mode)
         assert os.readlink(fullname) == "/imaginary/dest"
         assert fstat.st_nlink == 1
-        assert linkname in llfuse.listdir(self.mnt_dir)
+        assert linkname in pyfuse3.listdir(self.mnt_dir)
         os.unlink(fullname)
         assert_raises(FileNotFoundError, os.lstat, fullname)
-        assert linkname not in llfuse.listdir(self.mnt_dir)
+        assert linkname not in pyfuse3.listdir(self.mnt_dir)
 
     def tst_mknod(self):
         filename = os.path.join(self.mnt_dir, self.newname())
@@ -215,11 +229,11 @@ class TestFuse:
         fstat = os.lstat(filename)
         assert stat.S_ISREG(fstat.st_mode)
         assert fstat.st_nlink == 1
-        assert basename(filename) in llfuse.listdir(self.mnt_dir)
+        assert basename(filename) in pyfuse3.listdir(self.mnt_dir)
         assert filecmp.cmp(src, filename, False)
         os.unlink(filename)
         assert_raises(FileNotFoundError, os.stat, filename)
-        assert basename(filename) not in llfuse.listdir(self.mnt_dir)
+        assert basename(filename) not in pyfuse3.listdir(self.mnt_dir)
 
     def tst_chown(self):
         filename = os.path.join(self.mnt_dir, self.newname())
@@ -242,7 +256,7 @@ class TestFuse:
 
         os.rmdir(filename)
         assert_raises(FileNotFoundError, os.stat, filename)
-        assert basename(filename) not in llfuse.listdir(self.mnt_dir)
+        assert basename(filename) not in pyfuse3.listdir(self.mnt_dir)
 
     def tst_write(self):
         name = os.path.join(self.mnt_dir, self.newname())
@@ -270,7 +284,7 @@ class TestFuse:
         assert fstat1 == fstat2
         assert fstat1.st_nlink == 2
 
-        assert basename(name2) in llfuse.listdir(self.mnt_dir)
+        assert basename(name2) in pyfuse3.listdir(self.mnt_dir)
         assert filecmp.cmp(name1, name2, False)
         os.unlink(name2)
         fstat1 = os.lstat(name1)
@@ -289,7 +303,7 @@ class TestFuse:
         os.mkdir(subdir)
         shutil.copyfile(src, subfile)
 
-        listdir_is = llfuse.listdir(dir_)
+        listdir_is = pyfuse3.listdir(dir_)
         listdir_is.sort()
         listdir_should = [ basename(file_), basename(subdir) ]
         listdir_should.sort()
@@ -326,8 +340,7 @@ class TestFuse:
         fstat = os.stat(filename)
         size = fstat.st_size
 
-        subprocess.check_call(self.s3ql_cmd_argv('s3qlctrl') +
-                              [ '--quiet', 'flushcache', self.mnt_dir ])
+        self.flush_cache()
 
         fd = os.open(filename, os.O_RDWR)
 
@@ -345,8 +358,13 @@ class TestFuse:
         fullname = self.mnt_dir + "/" + dirname
         os.mkdir(fullname)
         assert stat.S_ISDIR(os.stat(fullname).st_mode)
-        assert dirname in llfuse.listdir(self.mnt_dir)
-        cmd = ('(%d, %r)' % (llfuse.ROOT_INODE, path2bytes(dirname))).encode()
-        llfuse.setxattr('%s/%s' % (self.mnt_dir, CTRL_NAME), 'rmtree', cmd)
+        assert dirname in pyfuse3.listdir(self.mnt_dir)
+        cmd = ('(%d, %r)' % (pyfuse3.ROOT_INODE, path2bytes(dirname))).encode()
+        pyfuse3.setxattr('%s/%s' % (self.mnt_dir, CTRL_NAME), 'rmtree', cmd)
+        # Invalidation is asynchronous...
+        try:
+            retry(5, lambda: not os.path.exists(fullname))
+        except RetryTimeoutError:
+            pass # assert_raises should fail
         assert_raises(FileNotFoundError, os.stat, fullname)
-        assert dirname not in llfuse.listdir(self.mnt_dir)
+        assert dirname not in pyfuse3.listdir(self.mnt_dir)

@@ -14,13 +14,16 @@ if __name__ == '__main__':
 
 from s3ql.backends import local
 from s3ql.backends.comprenc import ComprencBackend
+from s3ql.backends.common import CorruptedObjectError
+from argparse import Namespace
 import shutil
+import re
 import tempfile
 import unittest
 import subprocess
 import pytest
 
-@pytest.mark.usefixtures('s3ql_cmd_argv', 'pass_reg_output')
+@pytest.mark.usefixtures('pass_s3ql_cmd_argv', 'pass_reg_output')
 class AdmTests(unittest.TestCase):
 
     def setUp(self):
@@ -39,15 +42,19 @@ class AdmTests(unittest.TestCase):
                                 ['-L', 'test fs', '--max-obj-size', '500',
                                  '--authfile', '/dev/null', '--cachedir', self.cache_dir,
                                  '--quiet', self.storage_url ],
-                                stdin=subprocess.PIPE, universal_newlines=True)
+                                stdin=subprocess.PIPE, universal_newlines=True,
+                                stdout=subprocess.PIPE)
 
         print(self.passphrase, file=proc.stdin)
         print(self.passphrase, file=proc.stdin)
         proc.stdin.close()
-
+        stdout = proc.stdout.read()
+        proc.stdout.close()
         self.assertEqual(proc.wait(), 0)
         self.reg_output(r'^WARNING: Maximum object sizes less than '
                         '1 MiB will degrade performance\.$', count=1)
+
+        return stdout
 
     def test_passphrase(self):
         self.mkfs()
@@ -66,30 +73,58 @@ class AdmTests(unittest.TestCase):
 
         self.assertEqual(proc.wait(), 0)
 
-        plain_backend = local.Backend(self.storage_url, None, None)
+        plain_backend = local.Backend(Namespace(
+            storage_url=self.storage_url))
         backend = ComprencBackend(passphrase_new.encode(), ('zlib', 6), plain_backend)
 
         backend.fetch('s3ql_passphrase') # will fail with wrong pw
 
-
-    def test_authinfo(self):
+    def test_clear(self):
         self.mkfs()
 
-        with tempfile.NamedTemporaryFile('wt') as fh:
-            print('[entry1]',
-                  'storage-url: local://',
-                  'fs-passphrase: clearly wrong',
-                  '',
-                  '[entry2]',
-                  'storage-url: %s' % self.storage_url,
-                  'fs-passphrase: %s' % self.passphrase,
-                  file=fh, sep='\n')
-            fh.flush()
+        proc = subprocess.Popen(self.s3ql_cmd_argv('s3qladm') +
+                                [ '--quiet', '--log', 'none', '--authfile',
+                                  '/dev/null', 'clear', self.storage_url ],
+                                stdin=subprocess.PIPE, universal_newlines=True)
+        print('yes', file=proc.stdin)
+        proc.stdin.close()
+        self.assertEqual(proc.wait(), 0)
 
-            proc = subprocess.Popen(self.s3ql_cmd_argv('fsck.s3ql') +
-                                    [ '--quiet', '--authfile', fh.name,
-                                      '--cachedir', self.cache_dir, '--log', 'none', self.storage_url ],
-                                    stdin=subprocess.PIPE, universal_newlines=True)
+        plain_backend = local.Backend(Namespace(
+            storage_url=self.storage_url))
+        assert list(plain_backend.list()) == []
 
-            proc.stdin.close()
-            self.assertEqual(proc.wait(), 0)
+
+    def test_key_recovery(self):
+        mkfs_output = self.mkfs()
+
+        hit = re.search(r'^---BEGIN MASTER KEY---\n'
+                        r'(.+)\n'
+                        r'---END MASTER KEY---$', mkfs_output, re.MULTILINE)
+        assert hit
+        master_key = hit.group(1)
+
+        plain_backend = local.Backend(Namespace(
+            storage_url=self.storage_url))
+        del plain_backend['s3ql_passphrase']  # Oops
+
+        backend = ComprencBackend(self.passphrase.encode(), ('zlib', 6), plain_backend)
+        with pytest.raises(CorruptedObjectError):
+            backend.fetch('s3ql_metadata')
+
+        passphrase_new = 'sd982jhd'
+
+        proc = subprocess.Popen(self.s3ql_cmd_argv('s3qladm') +
+                                [ '--quiet', '--log', 'none', '--authfile',
+                                  '/dev/null', 'recover-key', self.storage_url ],
+                                stdin=subprocess.PIPE, universal_newlines=True)
+
+        print(master_key, file=proc.stdin)
+        print(passphrase_new, file=proc.stdin)
+        print(passphrase_new, file=proc.stdin)
+        proc.stdin.close()
+        self.assertEqual(proc.wait(), 0)
+
+        backend = ComprencBackend(passphrase_new.encode(), ('zlib', 6), plain_backend)
+
+        backend.fetch('s3ql_passphrase') # will fail with wrong pw

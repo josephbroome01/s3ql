@@ -9,7 +9,7 @@ This work can be distributed under the terms of the GNU GPLv3.
 from .logging import logging, setup_logging
 from .common import assert_fs_owner, pretty_print_size
 from .parse_args import ArgumentParser
-import llfuse
+import pyfuse3
 import struct
 import sys
 
@@ -21,6 +21,7 @@ def parse_args(args):
     parser = ArgumentParser(
         description="Print file system statistics.")
 
+    parser.add_log()
     parser.add_debug()
     parser.add_quiet()
     parser.add_version()
@@ -53,9 +54,9 @@ def main(args=None):
     # Use a decent sized buffer, otherwise the statistics have to be
     # calculated three(!) times because we need to invoke getxattr
     # three times.
-    buf = llfuse.getxattr(ctrlfile, 's3qlstat', size_guess=256)
+    buf = pyfuse3.getxattr(ctrlfile, 's3qlstat', size_guess=256)
 
-    (entries, blocks, inodes, fs_size, dedup_size,
+    (entries, objects, inodes, fs_size, dedup_size,
      compr_size, db_size, cache_cnt, cache_size, dirty_cnt,
      dirty_size, removal_cnt) = struct.unpack('QQQQQQQQQQQQ', buf)
     p_dedup = dedup_size * 100 / fs_size if fs_size else 0
@@ -63,7 +64,7 @@ def main(args=None):
     p_compr_2 = compr_size * 100 / dedup_size if dedup_size else 0
     print ('Directory entries:    %d' % entries,
            'Inodes:               %d' % inodes,
-           'Data blocks:          %d' % blocks,
+           'Data objects:         %d' % objects,
            'Total data size:      %s' % pprint(fs_size),
            'After de-duplication: %s (%.2f%% of total)'
              % (pprint(dedup_size), p_dedup),

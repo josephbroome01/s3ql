@@ -33,12 +33,17 @@ are:
 # Pylint really gets confused by this module
 #pylint: disable-all
 
-
-from . import RELEASE
-from argparse import ArgumentTypeError, ArgumentError
-import argparse
 from .logging import logging # Ensure use of custom logger class
+from . import RELEASE
+from .backends import prefix_map
+from .common import _escape
+from getpass import getpass
+from argparse import ArgumentTypeError, ArgumentError
+import configparser
+import argparse
+import stat
 import os
+import sys
 import re
 
 DEFAULT_USAGE = object()
@@ -157,12 +162,6 @@ class ArgumentParser(argparse.ArgumentParser):
                           help="Activate debugging output from all S3QL modules. "
                                + destnote)
 
-    def add_authfile(self):
-        self.add_argument("--authfile", type=str, metavar='<path>',
-                      default=os.path.expanduser("~/.s3ql/authinfo2"),
-                      help='Read authentication credentials from this file '
-                           '(default: `~/.s3ql/authinfo2)`')
-
     def add_cachedir(self):
         self.add_argument("--cachedir", type=str, metavar='<path>',
                       default=os.path.expanduser("~/.s3ql"),
@@ -181,6 +180,33 @@ class ArgumentParser(argparse.ArgumentParser):
         self.add_argument("storage_url", metavar='<storage-url>',
                           type=storage_url_type,
                           help='Storage URL of the backend that contains the file system')
+        self.add_argument("--authfile", type=str, metavar='<path>',
+                      default=os.path.expanduser("~/.s3ql/authinfo2"),
+                      help='Read authentication credentials from this file '
+                           '(default: `~/.s3ql/authinfo2)`')
+
+    def add_compress(self):
+        def compression_type(s):
+            hit = re.match(r'^([a-z0-9]+)(?:-([0-9]))?$', s)
+            if not hit:
+                raise argparse.ArgumentTypeError('%s is not a valid --compress value' % s)
+            alg = hit.group(1)
+            lvl = hit.group(2)
+            if alg not in ('none', 'zlib', 'bzip2', 'lzma'):
+                raise argparse.ArgumentTypeError('Invalid compression algorithm: %s' % alg)
+            if lvl is None:
+                lvl = 6
+            else:
+                lvl = int(lvl)
+            if alg == 'none':
+                alg = None
+            return (alg, lvl)
+        self.add_argument("--compress", action="store", default='lzma-6',
+                            metavar='<algorithm-lvl>', type=compression_type,
+                            help="Compression algorithm and compression level to use when "
+                                 "storing new data. *algorithm* may be any of `lzma`, `bzip2`, "
+                                 "`zlib`, or none. *lvl* may be any integer from 0 (fastest) "
+                                 "to 9 (slowest). Default: `%(default)s`")
 
     def add_subparsers(self, **kw):
         '''Pass parent and set prog to default usage message'''
@@ -199,12 +225,105 @@ class ArgumentParser(argparse.ArgumentParser):
 
         return super().add_subparsers(**kw)
 
+    def _read_authinfo(self, path, storage_url):
+
+        ini_config = configparser.ConfigParser()
+        if os.path.isfile(path):
+            mode = os.stat(path).st_mode
+            if mode & (stat.S_IRGRP | stat.S_IROTH):
+                self.exit(12, "%s has insecure permissions, aborting." % path)
+            ini_config.read(path)
+
+        merged = dict()
+        for section in ini_config.sections():
+            pattern = ini_config[section].get('storage-url', None)
+            if not pattern or not storage_url.startswith(pattern):
+                continue
+
+            for (key, val) in ini_config[section].items():
+                if key != 'storage-url':
+                    merged[key] = val
+        return merged
+
     def parse_args(self, *args, **kwargs):
 
         try:
-            return super().parse_args(*args, **kwargs)
+            options = super().parse_args(*args, **kwargs)
         except ArgumentError as exc:
-            self.exit(str(exc))
+            self.error(str(exc))
+
+        if hasattr(options, 'authfile'):
+            storage_url = getattr(options, 'storage_url', '')
+            ini_config = self._read_authinfo(options.authfile, storage_url)
+
+            # Validate configuration file
+            fixed_keys = { 'backend-login', 'backend-password', 'fs-passphrase',
+                           'storage-url' }
+            unknown_keys = (set(ini_config.keys())
+                            - { x.replace('_', '-') for x in options.__dict__.keys() }
+                            - fixed_keys)
+            if unknown_keys:
+                            self.exit(2, 'Unknown keys(s) in configuration file: ' +
+                                      ', '.join(unknown_keys))
+
+            # Update defaults and re-parse arguments
+            defaults = { k.replace('-', '_'): v
+                         for (k,v) in ini_config.items()
+                         if k != 'storage_url' }
+            self.set_defaults(**defaults)
+            options = super().parse_args(*args, **kwargs)
+
+        if hasattr(options, 'storage_url'):
+            self._init_backend_factory(options)
+
+        if hasattr(options, 'cachedir'):
+            assert options.storage_url
+            if not os.path.exists(options.cachedir):
+                try:
+                    os.mkdir(options.cachedir, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+                except PermissionError:
+                    self.exit(45, 'No permission to create cache directory ' + options.cachedir)
+
+            if not os.access(options.cachedir, os.R_OK | os.W_OK | os.X_OK):
+                self.exit(45, 'No permission to access cache directory ' + options.cachedir)
+
+            cachedir = os.path.abspath(options.cachedir)
+            os.environ['SQLITE_TMPDIR'] = cachedir
+            options.cachepath = os.path.join(cachedir, _escape(options.storage_url))
+
+        return options
+
+    def _init_backend_factory(self, options):
+        storage_url = options.storage_url
+        hit = re.match(r'^([a-zA-Z0-9]+)://', storage_url)
+        if not hit:
+            self.exit(2, 'Unable to parse storage url ' + storage_url)
+
+        backend = hit.group(1)
+        try:
+            backend_class = prefix_map[backend]
+        except KeyError:
+            self.exit(11, 'No such backend: ' + backend)
+
+        backend_options = options.backend_options
+        for opt in backend_options.keys():
+            if opt not in backend_class.known_options:
+                self.exit(3, 'Unknown backend option: ' + opt)
+
+        if not hasattr(options, 'backend_login') and backend_class.needs_login:
+            if sys.stdin.isatty():
+                options.backend_login = getpass("Enter backend login: ")
+            else:
+                options.backend_login = sys.stdin.readline().rstrip()
+
+        if not hasattr(options, 'backend_password') and backend_class.needs_login:
+            if sys.stdin.isatty():
+                options.backend_password = getpass("Enter backend password: ")
+            else:
+                options.backend_password = sys.stdin.readline().rstrip()
+
+        options.backend_class = backend_class
+
 
 def storage_url_type(s):
     '''Validate and canonicalize storage url'''

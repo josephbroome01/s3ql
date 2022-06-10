@@ -11,12 +11,6 @@ initialize logging and adjust the load path before running
 any tests.
 '''
 
-# Python version check
-import sys
-if sys.version_info < (3,3):
-    raise SystemExit('Python version is %d.%d.%d, but S3QL requires Python 3.3 or newer'
-                     % sys.version_info[:3])
-
 import logging.handlers
 import sys
 import os.path
@@ -25,6 +19,10 @@ import faulthandler
 import signal
 import gc
 import time
+import pytest_trio
+
+
+assert pytest_trio  # suppress unused import warning
 
 # If a test fails, wait a moment before retrieving the captured
 # stdout/stderr. When using a server process (like in t4_fuse.py), this makes
@@ -45,26 +43,24 @@ def s3ql_cmd_argv(request):
     '''Provide argument list to execute s3ql commands in tests'''
 
     if request.config.getoption('installed'):
-        request.cls.s3ql_cmd_argv = lambda self, cmd: [ cmd ]
+        yield lambda cmd: [ cmd ]
     else:
         basedir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        request.cls.s3ql_cmd_argv = lambda self, cmd: [ sys.executable,
-                                                        os.path.join(basedir, 'bin', cmd) ]
+        yield lambda cmd: [ sys.executable,
+                            os.path.join(basedir, 'bin', cmd) ]
 
 # Enable output checks
-pytest_plugins = ('pytest_checklogs')
-
-# Ignore DeprecationWarnings when running unit tests.  They are
-# unfortunately quite often a result of indirect imports via third party
-# modules, so we can't actually fix them.
-@pytest.fixture(autouse=True)
-def ignore_depreciation_warnings(reg_output):
-    reg_output(r'(Pending)?DeprecationWarning', count=0)
+pytest_plugins = ('pytest_checklogs',)
 
 @pytest.fixture()
 def pass_reg_output(request, reg_output):
     '''Provide reg_output function to UnitTest instances'''
     request.instance.reg_output = reg_output
+
+@pytest.fixture()
+def pass_s3ql_cmd_argv(request, s3ql_cmd_argv):
+    '''Provide s3ql_cmd_argv function to UnitTest instances'''
+    request.instance.s3ql_cmd_argv = s3ql_cmd_argv
 
 def pytest_addoption(parser):
     group = parser.getgroup("terminal reporting")
@@ -86,17 +82,30 @@ def pytest_configure(config):
             os.path.exists(os.path.join(basedir, 'src', 's3ql', '__init__.py'))):
             sys.path = [os.path.join(basedir, 'src')] + sys.path
 
-    # When running from HG repo, enable all warnings
+    # When running from HG repo, enable warnings
     if os.path.exists(os.path.join(basedir, 'MANIFEST.in')):
         import warnings
         warnings.resetwarnings()
-        warnings.simplefilter('default')
+
+        # Not sure what this is or what causes it, bug the internet
+        # is full of similar reports so probably a false positive.
+        warnings.filterwarnings(
+            action='ignore', category=ImportWarning,
+            message="can't resolve package from __spec__ or __package__, falling "
+            "back on __name__ and __path__")
+
+        for cat in (DeprecationWarning, PendingDeprecationWarning):
+            warnings.filterwarnings(action='default', category=cat,
+                                    module='s3ql', append=True)
+            warnings.filterwarnings(action='ignore', category=cat, append=True)
+        warnings.filterwarnings(action='default', append=True)
+        os.environ['S3QL_ENABLE_WARNINGS'] = '1'
 
     # Enable faulthandler
-    global faultlog_fh
-    faultlog_fh = open(os.path.join(basedir, 'tests', 'test_crit.log'), 'a')
-    faulthandler.enable(faultlog_fh)
-    faulthandler.register(signal.SIGUSR1, file=faultlog_fh)
+    faultlog_fd = os.open(os.path.join(basedir, 'tests', 'test_crit.log'),
+                          flags=os.O_APPEND|os.O_CREAT|os.O_WRONLY, mode=0o644)
+    faulthandler.enable(faultlog_fd)
+    faulthandler.register(signal.SIGUSR1, file=faultlog_fd)
 
     # Configure logging. We don't set a default handler but rely on
     # the catchlog pytest plugin.

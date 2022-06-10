@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 '''
 setup.py - this file is part of S3QL.
 
@@ -7,23 +8,19 @@ Copyright © 2008 Nikolaus Rath <Nikolaus@rath.org>
 This work can be distributed under the terms of the GNU GPLv3.
 '''
 
-# Python version check
-import sys
-if sys.version_info < (3,3):
-    raise SystemExit('Python version is %d.%d.%d, but S3QL requires Python 3.3 or newer'
-                     % sys.version_info[:3])
-
 try:
     import setuptools
-except ImportError:
+except ModuleNotFoundError:
     raise SystemExit('Setuptools package not found. Please install from '
                      'https://pypi.python.org/pypi/setuptools')
 from setuptools import Extension
+from setuptools.command.test import test as TestCommand
 
 from distutils.version import LooseVersion
 import os
 import subprocess
 import re
+import sys
 from glob import glob
 import faulthandler
 faulthandler.enable()
@@ -38,70 +35,15 @@ sys.path.insert(0, os.path.join(basedir, 'src'))
 sys.path.insert(0, os.path.join(basedir, 'util'))
 import s3ql
 
-class build_docs(setuptools.Command):
-    description = 'Build Sphinx documentation'
-    user_options = [
-        ('fresh-env', 'E', 'discard saved environment'),
-        ('all-files', 'a', 'build all files'),
-    ]
-    boolean_options = ['fresh-env', 'all-files']
 
-    def initialize_options(self):
-        self.fresh_env = False
-        self.all_files = False
+class pytest(TestCommand):
 
-    def finalize_options(self):
-        pass
+    def run_tests(self):
+        # import here, cause outside the eggs aren't loaded
+        import pytest
 
-    def run(self):
-        try:
-            from sphinx.application import Sphinx
-            from docutils.utils import SystemMessage
-        except ImportError:
-            raise SystemExit('This command requires Sphinx to be installed.') from None
-
-        fix_docutils()
-
-        dest_dir = os.path.join(basedir, 'doc')
-        src_dir = os.path.join(basedir, 'rst')
-
-        confoverrides = {}
-        confoverrides['version'] = s3ql.VERSION
-        confoverrides['release'] = s3ql.RELEASE
-
-        for builder in ('html', 'latex', 'man'):
-            print('Running %s builder...' % builder)
-            self.mkpath(os.path.join(dest_dir, builder))
-            app = Sphinx(srcdir=src_dir, confdir=src_dir,
-                         outdir=os.path.join(dest_dir, builder),
-                         doctreedir=os.path.join(dest_dir, 'doctrees'),
-                         buildername=builder, confoverrides=confoverrides,
-                         freshenv=self.fresh_env)
-            self.fresh_env = False
-            self.all_files = False
-
-            try:
-                if self.all_files:
-                    app.builder.build_all()
-                else:
-                    app.builder.build_update()
-            except SystemMessage as err:
-                print('reST markup error:',
-                      err.args[0].encode('ascii', 'backslashreplace'),
-                      file=sys.stderr)
-
-        # These shouldn't be installed by default
-        for name in ('expire_backups.1', 'pcp.1'):
-            os.rename(os.path.join(dest_dir, 'man', name),
-                      os.path.join(basedir, 'contrib', name))
-
-        print('Running pdflatex...')
-        for _ in range(3):
-            with open('/dev/null', 'wb') as null:
-                subprocess.check_call(['pdflatex', '-interaction', 'batchmode', 'manual.tex'],
-                                      cwd=os.path.join(dest_dir, 'latex'), stdout=null)
-        os.rename(os.path.join(dest_dir, 'latex', 'manual.pdf'),
-                  os.path.join(dest_dir, 'manual.pdf'))
+        errno = pytest.main(['tests'])
+        sys.exit(errno)
 
 
 def main():
@@ -111,32 +53,40 @@ def main():
 
     compile_args = ['-Wall', '-Wextra', '-Wconversion', '-Wsign-compare']
 
-    # Value-changing conversions should always be explicit.
-    compile_args.append('-Werror=conversion')
-
-    # Note that (i > -1) is false if i is unsigned (-1 will be converted to
-    # a large positive value). We certainly don't want to do this by
-    # accident.
-    compile_args.append('-Werror=sign-compare')
-
     # Enable all fatal warnings only when compiling from Mercurial tip.
     # (otherwise we break forward compatibility because compilation with newer
     # compiler may fail if additional warnings are added)
     if DEVELOPER_MODE:
-        compile_args.append('-Werror')
-        compile_args.append('-Wfatal-errors')
+        if os.environ.get('CI') != 'true':
+            compile_args.append('-Werror')
+
+        # Value-changing conversions should always be explicit.
+        compile_args.append('-Werror=conversion')
+
+        # Note that (i > -1) is false if i is unsigned (-1 will be converted to
+        # a large positive value). We certainly don't want to do this by
+        # accident.
+        compile_args.append('-Werror=sign-compare')
+
         compile_args.append('-Wno-unused-function')
 
     required_pkgs = ['apsw >= 3.7.0',
-                     'pycrypto',
+                     'cryptography',
                      'requests',
                      'defusedxml',
                      'dugong >= 3.4, < 4.0',
-                     'llfuse >= 1.0, < 2.0' ]
+                     'google-auth',
+                     'google-auth-oauthlib',
+
+                     # Need trio.lowlevel
+                     'trio >= 0.15',
+                     'pyfuse3 >= 3.2.0, < 4.0' ]
+    if sys.version_info < (3, 7, 0):
+        required_pkgs.append('async_generator')
 
     setuptools.setup(
           name='s3ql',
-          zip_safe=True,
+          zip_safe=False,
           version=s3ql.VERSION,
           description='a full-featured file system for online data storage',
           long_description=long_desc,
@@ -162,8 +112,8 @@ def main():
                                  extra_compile_args=compile_args,
                                  extra_link_args=[ '-lsqlite3'])],
           data_files=[ ('share/man/man1',
-                          [ os.path.join('doc/man/', x) for x
-                            in glob(os.path.join(basedir, 'doc', 'man', '*.1')) ]) ],
+                          [ os.path.join('doc/manpages/', x) for x
+                            in glob(os.path.join(basedir, 'doc', 'manpages', '*.1')) ]) ],
           entry_points={ 'console_scripts':
                         [
                          'mkfs.s3ql = s3ql.mkfs:main',
@@ -181,10 +131,10 @@ def main():
                          ]
                           },
           install_requires=required_pkgs,
+          tests_require=['pytest >= 3.7'],
           cmdclass={'upload_docs': upload_docs,
                     'build_cython': build_cython,
-                    'build_sphinx': build_docs },
-          command_options={ 'sdist': { 'formats': ('setup.py', 'bztar') } },
+                    'pytest': pytest },
          )
 
 class build_cython(setuptools.Command):

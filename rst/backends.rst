@@ -30,38 +30,34 @@ environment variables.
    another, you need to use the :file:`clone_fs.py` script (from the
    :file:`contrib` directory in the S3QL tarball).
 
+
 Google Storage
 ==============
 
 .. program:: gs_backend
 
-`Google Storage <http://code.google.com/apis/storage/>`_ is an online
-storage service offered by Google. To use the Google Storage backend,
-you need to have (or sign up for) a Google account, and then `activate
-Google Storage <http://code.google.com/apis/storage/docs/signup.html>`_
-for your account. The account is free, you will pay only for the
-amount of storage and traffic that you actually use. There are two
-ways to access Google storage:
+`Google Storage <https://cloud.google.com/storage/>`_ is an online
+storage service offered by Google. In order to use it with S3QL, make
+sure that you enable the JSON API in the `GCP Console API Library
+<https://console.cloud.google.com/apis/library/>`_
 
-#. Use S3-like authentication. To do this, first `set a  default
-   project
-   <https://developers.google.com/storage/docs/migrating#defaultproj>`_.
-   Then use the `key management tool
-   <https://code.google.com/apis/console/#:storage:legacy>`_ to
-   retrieve your *Google Storage developer access key* and *Google
-   Storage developer secret* and use that as backend login and backend
-   password.
+The Google Storage backend uses OAuth2 authentication or ADC_
+(Application Default Credentials).
 
-#. Use OAuth2 authentication. In this case you need to use ``oauth2``
-   as the backend login, and a valid OAuth2 refresh token as the
-   backend password. To obtain a refresh token, you can use the
-   :ref:`s3ql_oauth_client <oauth_client>` program. It will instruct
-   you to open a specific URL in your browser, enter a code and
-   authenticate with your Google account. Once this procedure is
-   complete, :ref:`s3ql_oauth_client <oauth_client>` will print out
-   the refresh token. Note that you need to do this procedure only
-   once, the refresh token will remain valid until you explicitly
-   revoke it.
+.. _ADC: https://cloud.google.com/docs/authentication/production
+
+To use OAuth2 authentication, specify ``oauth2`` as the backend login
+and a valid OAuth2 refresh token as the backend password. To obtain a
+refresh token, you can use the :ref:`s3ql_oauth_client <oauth_client>`
+program. It will instruct you to open a specific URL in your browser,
+enter a code and authenticate with your Google account. Once this
+procedure is complete, :ref:`s3ql_oauth_client <oauth_client>` will
+print out the refresh token. Note that you need to do this procedure
+only once, the refresh token will remain valid until you explicitly
+revoke it.
+
+To use ADC, specify ``adc`` as the backend login and use an arbitrary
+value for the backend password.
 
 To create a Google Storage bucket, you can use e.g. the `Google
 Storage Manager`_. The storage URL for accessing the bucket in S3QL is
@@ -75,10 +71,6 @@ S3QL. This allows you to store several S3QL file systems in the same
 Google Storage bucket.
 
 The Google Storage backend accepts the following backend options:
-
-.. option:: no-ssl
-
-   Disable encrypted (https) connections and use plain HTTP instead.
 
 .. option:: ssl-ca-path=<path>
 
@@ -94,7 +86,8 @@ The Google Storage backend accepts the following backend options:
    exchanged with the remote server for longer than this period, the
    TCP connection is closed and re-established (default: 20 seconds).
 
-.. _`Google Storage Manager`: https://sandbox.google.com/storage/
+.. _`Google Storage Manager`: https://console.cloud.google.com/storage/browser
+
 
 Amazon S3
 =========
@@ -109,8 +102,7 @@ traffic that you actually use. After that, you need to create a bucket
 that will hold the S3QL file system, e.g. using the `AWS Management
 Console <https://console.aws.amazon.com/s3/home>`_. For best
 performance, it is recommend to create the bucket in the
-geographically closest storage region, but not the US Standard region
-(see :ref:`durability` for the reason).
+geographically closest storage region.
 
 The storage URL for accessing S3 buckets in S3QL has the form ::
 
@@ -158,9 +150,20 @@ The Amazon S3 backend accepts the following backend options:
     side encryption are probably rather small, and this option does
     *not* affect any client side encryption performed by S3QL itself.
 
+.. option:: it
+
+   Use INTELLIGENT_TIERING storage class for new objects.
+   See `AWS S3 Storage classes <https://docs.aws.amazon.com/AmazonS3/latest/dev/storage-class-intro.html>`_
+
 .. option:: ia
 
-   Use infrequent access storage class for new objects.
+   Use STANDARD_IA (infrequent access) storage class for new objects.
+   See `AWS S3 Storage classes <https://docs.aws.amazon.com/AmazonS3/latest/dev/storage-class-intro.html>`_
+
+.. option:: oia
+
+   Use ONEZONE_IA (infrequent access) storage class for new objects.
+   See `AWS S3 Storage classes <https://docs.aws.amazon.com/AmazonS3/latest/dev/storage-class-intro.html>`_
 
 .. option:: rrs
 
@@ -191,12 +194,13 @@ authentication, the storage URL is ::
 
    swift://<hostname>[:<port>]/<container>[/<prefix>]
 
-for Keystone (v2) authentication, the storage URL is ::
+for Keystone (v2 and v3) authentication, the storage URL is ::
 
    swiftks://<hostname>[:<port>]/<region>:<container>[/<prefix>]
 
 Note that when using Keystone authentication, you can (and have to)
-specify the storage region of the container as well.
+specify the storage region of the container as well. Also note that when
+using Keystone v3 authentication, the :var:`domain` option is required.
 
 In both cases, *hostname* name should be the name of the
 authentication server.  The storage container must already exist (most
@@ -209,9 +213,12 @@ When using legacy authentication, the backend login and password
 correspond to the OpenStack username and API Access Key. When using
 Keystone authentication, the backend password is your regular
 OpenStack password and the backend login combines you OpenStack
-username and tenant name in the form `<tenant>:<user>`. If no tenant
-is required, the OpenStack username alone may be used as backend
-login.
+username and tenant/project in the form :var:`<tenant>:<user>`.
+If no tenant is required, the OpenStack username alone may be used as
+backend login. For Keystone v2 :var:`<tenant>` needs to be the
+tenant name (:envvar:`!OS_TENANT_NAME` in the OpenStack RC File).
+For Keystone v3 :var:`<tenant>` needs to be the project ID
+(:envvar:`!OS_TENANT_ID` in the OpenStack RC File).
 
 The OpenStack backend accepts the following backend options:
 
@@ -251,6 +258,50 @@ The OpenStack backend accepts the following backend options:
    advanced features of the Swift backend. In this case S3QL can only
    use the least common denominator of supported Swift versions and
    configurations.
+
+.. option:: domain
+
+   If this option is specified, S3QL will use the Keystone v3 API. The
+   default domain ID for OpenStack installations is :var:`default`. If this
+   option is specified without setting the :var:`project-domain` option, this
+   will be used for both the project and the user domain.
+   You need to provide the domain ID not the domain name to this option.
+   If your provider did not give you a domain ID, then it is most likely
+   :var:`default`.
+
+.. option:: domain-is-name
+
+   If your provider only supplies you with the name of your domain and not the uuid,
+   you need to set this :var:`domain-is-name` option, whereby the :var:`domain` is used as the domain name,
+   not the domain id.
+
+.. option:: project-domain
+
+   In simple cases, the project domain will be the same as the auth
+   domain. If the :var:`project-domain` option is not specified, it will be
+   assumed to be the same as the user domain.
+   You need to provide the domain ID not the domain name to this option.
+   If your provider did not give you a domain ID, then it is most likely
+   :var:`default`.
+
+.. option:: project-domain-is-name
+
+   If your provider only supplies you with the name of your project domain and not the uuid,
+   you need to set this :var:`project-domain-name` option, whereby the :var:`project-domain` is used
+   as the name of the project domain, not the id of the project domain.
+   If project-domain-is-name is not set, it is assumed the same as domain-is-name.
+
+.. option:: tenant-is-name
+
+   Some providers use the tenant name to specify the storage location, and others use the tenant id.
+   If your provider uses the tenant name and not the id, you need to set this :var:`tenant-is-name` option.
+   If :var:`tenant-is-name` is provided, the :var:`<tenant>` component of the login is used as the tenant
+   name, not the tenant id.
+
+.. option:: identity-url
+
+   If your provider does not use hostname:port/v3/auth/tokens but instead has another identity URL, you can use this option.
+   It allows to replace /v3/auth/tokens with another path like for example /identity/v3/auth/tokens
 
 .. __: http://tools.ietf.org/html/rfc2616#section-8.2.3
 .. _OpenStack: http://www.openstack.org/
@@ -349,10 +400,76 @@ The S3 compatible backend accepts the following backend options:
    server only returns ``200 OK`` when the copy operation has been
    completely and successfully carried out. Using this option may be
    neccessary if your storage server does not return a valid response
-   body for a succesfull copy operation.
+   body for a successful copy operation.
 
 .. _`S3 COPY API`: http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectCOPY.html
 .. __: https://doc.s3.amazonaws.com/proposals/copy.html
+
+
+Backblaze B2
+============
+
+.. program:: b2_backend
+
+Backblaze B2 is a cloud storage with its own API.
+
+The storage URL for backblaze b2 storage is ::
+
+   b2://<bucket-name>[/<prefix>]
+
+*bucket-name* is an (existing) bucket which has to be accessible with
+the provided account key. The *prefix* will be appended to all names
+used by S3QL and can be used to hold separate S3QL repositories in the
+same bucket.
+
+It is also possible to use an application key. The required key capabilities
+are the following:
+
+   - `listBuckets`
+   - `listFiles`
+   - `readFiles`
+   - `writeFiles`
+   - `deleteFiles`
+
+.. option:: disable-versions
+
+   If versioning of the bucket is not enabled, this option can be set.
+   When deleting objects, the bucket will not be scanned for all file versions
+   because it will be implied that only the one (the most recent) version of a
+   file exists. This will use only one class B transaction instead of
+   (possibly) multiple class C transactions.
+
+.. option:: retry-on-cap-exceeded
+
+   If there are data/transaction caps set for the backblaze account, this option
+   controls if operations should be retried as cap counters are reset every day.
+   Otherwise the exception would abort the program.
+
+.. option:: test-mode-fail-some-uploads
+
+   This option puts the backblaze B2 server into test mode by adding a special header
+   to the upload requests. The server will then randomly fail some uploads. Use
+   only to test the failure resiliency of the backend implementation as it causes
+   unnecessary traffic, delays and transactions.
+
+.. option:: test-mode-expire-some-tokens
+
+   Similarly to the option above this lets the server fail some authorization tokens
+   in order to test the reauthorization of the backend implementation.
+
+.. option:: test-mode-force-cap-exceeded
+
+   Like above this option instructs the server to behave as if the data/transaction
+   caps were exceeded. Use this only to test the backend implementation for correct/desired
+   behavior. Can be useful in conjunction with *retry-on-cap-exceeded* option.
+
+.. option:: tcp-timeout
+
+   Specifies the timeout used for TCP connections. If no data can be
+   exchanged with the remote server for longer than this period, the
+   TCP connection is closed and re-established (default: 20 seconds).
+
+.. _Backblaze B2 API: https://www.backblaze.com/b2/docs/
 
 
 Local

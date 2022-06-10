@@ -31,7 +31,13 @@ and (if the file system was mounted with :cmdopt:`--allow-other` or
 The following actions may be specified:
 
 flushcache
-  Uploads all changed file data to the backend.
+  Flush file system cache, i.e. upload all changed file data
+  to the backend.  The command blocks until the cache has been
+  flushed.
+
+dropcache
+  Flush, and then drop file system cache. The command
+  blocks until the cache has been flushed and dropped.
 
 upload-meta
   Upload metadata to the backend. All file system operations will
@@ -48,7 +54,7 @@ log
   Change the amount of information that is logged into
   :file:`~/.s3ql/mount.log` file. The complete syntax is::
 
-    s3qlctrl [options] log <mountpoint> <level> [<module> [<module> ...]]
+    s3qlctrl [options] log <mountpoint> <level> [<module> ...]
 
   here :var:`level` is the desired new log level and may be either of
   *debug*, *info* or *warn*. One or more :var:`module` may only be
@@ -62,7 +68,7 @@ Options
 The |command| command also accepts the following options, no matter
 what specific action is being invoked:
 
-.. pipeinclude:: python ../../bin/s3qlctrl --help
+.. pipeinclude:: ../../bin/s3qlctrl --help
    :start-after: show this help message and exit
 
 

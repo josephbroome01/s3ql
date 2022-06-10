@@ -9,8 +9,7 @@ This work can be distributed under the terms of the GNU GPLv3.
 from ..logging import logging, QuietError, LOG_ONCE # Ensure use of custom logger class
 from .. import BUFSIZE
 from .common import (AbstractBackend, NoSuchObject, retry, AuthorizationError,
-                     DanglingStorageURLError, retry_generator, get_proxy,
-                     get_ssl_context)
+                     DanglingStorageURLError, get_proxy, get_ssl_context)
 from .s3c import HTTPError, ObjectR, ObjectW, md5sum_b64, BadDigestError
 from . import s3c
 from ..inherit_docstrings import (copy_ancestor_docstring, prepend_ancestor_docstring,
@@ -46,12 +45,11 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
     _extractmeta = s3c.Backend._extractmeta
     _assert_empty_response = s3c.Backend._assert_empty_response
     _dump_response = s3c.Backend._dump_response
-    clear = s3c.Backend.clear
     reset = s3c.Backend.reset
 
-    def __init__(self, storage_url, login, password, options):
+    def __init__(self, options):
         super().__init__()
-        self.options = options
+        self.options = options.backend_options
         self.hostname = None
         self.port = None
         self.container_name = None
@@ -59,15 +57,15 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         self.auth_token = None
         self.auth_prefix = None
         self.conn = None
-        self.password = password
-        self.login = login
+        self.password = options.backend_password
+        self.login = options.backend_login
         self.features = Features()
 
         # We may need the context even if no-ssl has been specified,
         # because no-ssl applies only to the authentication URL.
-        self.ssl_context = get_ssl_context(options.get('ssl-ca-path', None))
+        self.ssl_context = get_ssl_context(self.options.get('ssl-ca-path', None))
 
-        self._parse_storage_url(storage_url, self.ssl_context)
+        self._parse_storage_url(options.storage_url, self.ssl_context)
         self.proxy = get_proxy(self.ssl_context is not None)
         self._container_exists()
 
@@ -127,11 +125,11 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         # codes where retry is definitely not desired. For 4xx (client error) we
         # do not retry in general, but for 408 (Request Timeout) RFC 2616
         # specifies that the client may repeat the request without
-        # modifications.
+        # modifications. We also retry on 429 (Too Many Requests).
         elif (isinstance(exc, HTTPError) and
               ((500 <= exc.status <= 599
                 and exc.status not in (501,505,508,510,511,523))
-               or exc.status == 408
+               or exc.status in (408,429)
                or 'client disconnected' in exc.msg.lower())):
             return True
 
@@ -195,10 +193,16 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
                     # fall through to scheme used for authentication
                     pass
 
-                self._detect_features(o.hostname, o.port)
+                # mock server can only handle one connection at a time
+                # so we explicitly disconnect this connection before
+                # opening the feature detection connection
+                # (mock server handles both - storage and authentication)
+                conn.disconnect()
 
-                conn =  HTTPConnection(o.hostname, o.port, proxy=self.proxy,
-                                       ssl_context=ssl_context)
+                self._detect_features(o.hostname, o.port, ssl_context)
+
+                conn = HTTPConnection(o.hostname, o.port, proxy=self.proxy,
+                                      ssl_context=ssl_context)
                 conn.timeout = int(self.options.get('tcp-timeout', 20))
                 return conn
 
@@ -250,12 +254,8 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
 
         # Expired auth token
         if resp.status == 401:
-            log.info('OpenStack auth token seems to have expired, requesting new one.')
-            self.conn.disconnect()
-            # Force constructing a new connection with a new token, otherwise
-            # the connection will be reestablished with the same token.
-            self.conn = None
-            raise AuthenticationExpired(resp.reason)
+            self._do_authentication_expired(resp.reason)
+            # raises AuthenticationExpired
 
         # If method == HEAD, server must not return response body
         # even in case of errors
@@ -474,10 +474,10 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         resp = self._do_request('POST', '/', subres='bulk-delete', body=body, headers=headers)
 
         # bulk deletes should always return 200
-        if resp.status is not 200:
+        if resp.status != 200:
             raise HTTPError(resp.status, resp.reason, resp.headers)
 
-        hit = re.match('^application/json(;\s*charset="?(.+?)"?)?$',
+        hit = re.match(r'^application/json(;\s*charset="?(.+?)"?)?$',
                        resp.headers['content-type'])
         if not hit:
             log.error('Unexpected server response. Expected json, got:\n%s',
@@ -489,14 +489,14 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         # but json.loads discards these whitespace characters automatically
         resp_dict = json.loads(self.conn.readall().decode(hit.group(2) or 'utf-8'))
 
-        hit = re.match('^([0-9]{3})', resp_dict['Response Status'])
-        if not hit:
-            log.error('Unexpected server response. Expected valid Response Status, got:\n%s',
-                      resp_dict)
-            raise RuntimeError('Unexpected server reply')
-        resp_status = int(hit.group(1))
+        log.debug('Response %s', resp_dict)
 
-        if resp_status is 200:
+        try:
+            resp_status_code, resp_status_text = _split_response_status(resp_dict['Response Status'])
+        except ValueError:
+            raise RuntimeError('Unexpected server reply')
+
+        if resp_status_code == 200:
             # No errors occured, everything has been deleted
             del keys[:]
             return
@@ -507,7 +507,7 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         offset = len(esc_prefix)
         for error in resp_dict['Errors']:
             fullkey = error[0]
-            # stangely the name is url encoded in JSON
+            # strangely the name is url encoded in JSON
             assert fullkey.startswith(esc_prefix)
             key = urllib.parse.unquote(fullkey[offset:])
             failed_keys.append(key)
@@ -516,27 +516,57 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
             if key not in failed_keys:
                 keys.remove(key)
 
-        # If *force*, just modify the passed list and return without
-        # raising an exception, otherwise raise exception for the first error
-        if force:
-            return
-
-        if resp_status in (400, 404) and len(resp_dict['Errors']) == 0:
+        if resp_status_code in (400, 404) and len(resp_dict['Errors']) == 0:
             # Swift returns 400 instead of 404 when files were not found.
             # (but we also accept the correct status code 404 if Swift
             # decides to correct this in the future)
 
             # ensure that we actually have objects that were not found
             # (otherwise there is a logic error that we need to know about)
-            assert(resp_dict['Number Not Found'] > 0)
+            assert resp_dict['Number Not Found'] > 0
 
-            # Unfortunately we cannot find out from the response which object
-            # was actually not found.
             # Since AbstractBackend.delete_multi allows this, we just
             # swallow this error even when *force* is False.
+            # N.B.: We removed even the keys from *keys* that are not found.
+            # This is because Swift only returns a counter of deleted
+            # objects, not the list of deleted objects (as S3 does).
             return
 
-        raise HTTPError(resp_status, resp_dict['Response Body'], {})
+        # At this point it is clear that the server has sent some kind of error response.
+        # Swift is not very consistent in returning errors.
+        # We need to jump through these hoops to get something meaningful.
+
+        error_msg = resp_dict['Response Body']
+        error_code = resp_status_code
+        if not error_msg:
+            if len(resp_dict['Errors']) > 0:
+                error_code, error_msg = _split_response_status(resp_dict['Errors'][0][1])
+            else:
+                error_msg = resp_status_text
+
+        if error_code == 401:
+            # Expired auth token
+            self._do_authentication_expired(error_msg)
+            # raises AuthenticationExpired
+        if 'Invalid bulk delete.' in error_msg:
+            error_code = 400
+            # change error message to something more meaningful
+            error_msg = 'Sent a bulk delete with an empty list of keys to delete'
+        elif 'Max delete failures exceeded' in error_msg:
+            error_code = 502
+        elif 'Maximum Bulk Deletes: ' in error_msg:
+            # Sent more keys in one bulk delete than allowed
+            error_code = 413
+        elif 'Invalid File Name' in error_msg:
+            # get returned when file name is too long
+            error_code = 422
+
+        raise HTTPError(error_code, error_msg, {})
+
+    @property
+    @copy_ancestor_docstring
+    def has_delete_multi(self):
+        return self.features.has_bulk_delete
 
     @copy_ancestor_docstring
     def delete_multi(self, keys, force=False):
@@ -610,7 +640,12 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         if metadata is not None:
             self._add_meta_headers(headers, metadata, chunksize=self.features.max_meta_len)
             headers['X-Fresh-Metadata'] = 'true'
-        resp = self._do_request('COPY', '/%s%s' % (self.prefix, src), headers=headers)
+        try:
+            resp = self._do_request('COPY', '/%s%s' % (self.prefix, src), headers=headers)
+        except HTTPError as exc:
+            if exc.status == 404:
+                raise NoSuchObject(src)
+            raise
         self._assert_empty_response(resp)
 
     @copy_ancestor_docstring
@@ -633,61 +668,68 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         self._do_request('POST', '/%s%s' % (self.prefix, key), headers=headers)
         self.conn.discard()
 
-    @retry_generator
     @copy_ancestor_docstring
-    def list(self, prefix='', start_after='', batch_size=5000):
-        log.debug('started with %s, %s', prefix, start_after)
-
-        keys_remaining = True
-        marker = self.prefix + start_after
+    def list(self, prefix=''):
         prefix = self.prefix + prefix
-
-        while keys_remaining:
-            log.debug('requesting with marker=%s', marker)
-
-            try:
-                resp = self._do_request('GET', '/', query_string={'prefix': prefix,
-                                                                  'format': 'json',
-                                                                  'marker': marker,
-                                                                  'limit': batch_size })
-            except HTTPError as exc:
-                if exc.status == 404:
-                    raise DanglingStorageURLError(self.container_name)
-                raise
-
-            if resp.status == 204:
-                return
-
-            hit = re.match('application/json; charset="?(.+?)"?$',
-                           resp.headers['content-type'])
-            if not hit:
-                log.error('Unexpected server response. Expected json, got:\n%s',
-                          self._dump_response(resp))
-                raise RuntimeError('Unexpected server reply')
-
-            strip = len(self.prefix)
-            count = 0
-            try:
-                # JSON does not have a streaming API, so we just read
-                # the entire response in memory.
-                for dataset in json.loads(self.conn.read().decode(hit.group(1))):
-                    count += 1
-                    marker = dataset['name']
-                    if marker.endswith(TEMP_SUFFIX):
-                        continue
-                    yield marker[strip:]
-
-            except GeneratorExit:
-                self.conn.discard()
+        strip = len(self.prefix)
+        page_token = None
+        while True:
+            (els, page_token) = self._list_page(prefix, page_token)
+            for el in els:
+                yield el[strip:]
+            if page_token is None:
                 break
 
-            keys_remaining = count == batch_size
+    @retry
+    def _list_page(self, prefix, page_token=None, batch_size=1000):
+
+        # Limit maximum number of results since we read everything
+        # into memory (because Python JSON doesn't have a streaming API)
+        query_string = { 'prefix': prefix, 'limit': str(batch_size),
+                         'format': 'json' }
+        if page_token:
+            query_string['marker'] = page_token
+
+        try:
+            resp = self._do_request('GET', '/', query_string=query_string)
+        except HTTPError as exc:
+            if exc.status == 404:
+                raise DanglingStorageURLError(self.container_name)
+            raise
+
+        if resp.status == 204:
+            return
+
+        hit = re.match('application/json; charset="?(.+?)"?$',
+                       resp.headers['content-type'])
+        if not hit:
+            log.error('Unexpected server response. Expected json, got:\n%s',
+                      self._dump_response(resp))
+            raise RuntimeError('Unexpected server reply')
+
+        body = self.conn.readall()
+        names = []
+        count = 0
+        for dataset in json.loads(body.decode(hit.group(1))):
+            count += 1
+            name = dataset['name']
+            if name.endswith(TEMP_SUFFIX):
+                continue
+            names.append(name)
+
+        if count == batch_size:
+            page_token = names[-1]
+        else:
+            page_token = None
+
+        return (names, page_token)
+
 
     @copy_ancestor_docstring
     def close(self):
         self.conn.disconnect()
 
-    def _detect_features(self, hostname, port):
+    def _detect_features(self, hostname, port, ssl_context):
         '''Try to figure out the Swift version and supported features by
         examining the /info endpoint of the storage server.
 
@@ -697,10 +739,6 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
         if 'no-feature-detection' in self.options:
             log.debug('Skip feature detection')
             return
-
-        ssl_context = self.ssl_context
-        if 'no-ssl' in self.options:
-            ssl_context = None
 
         if not port:
             port = 443 if ssl_context else 80
@@ -723,8 +761,8 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
                           self._dump_response(resp, body=conn.read(2048)))
                 raise HTTPError(resp.status, resp.reason, resp.headers)
 
-            if resp.status is 200:
-                hit = re.match('^application/json(;\s*charset="?(.+?)"?)?$',
+            if resp.status == 200:
+                hit = re.match(r'^application/json(;\s*charset="?(.+?)"?)?$',
                 resp.headers['content-type'])
                 if not hit:
                     log.error("Wrong server response. Expected json. Got: \n%s",
@@ -750,10 +788,21 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
 
                 if info.get('bulk_delete', False):
                     detected_features.has_bulk_delete = True
+                    bulk_delete = info['bulk_delete']
+                    assert bulk_delete.get('max_failed_deletes', 1000) <= \
+                           bulk_delete.get('max_deletes_per_request', 10000)
+                    assert bulk_delete.get('max_failed_deletes', 1000) > 0
                     # The block cache removal queue has a capacity of 1000.
-                    # We do not need bigger values than that (the default maximum is 10000).
-                    detected_features.max_deletes = max(1, min(1000,
-                        int(info['bulk_delete'].get('max_deletes_per_request', 1000))))
+                    # We do not need bigger values than that.
+                    # We use max_failed_deletes instead of max_deletes_per_request
+                    # because then we can be sure even when all our delete requests
+                    # get rejected we get a complete error list back from the server.
+                    # If we would set the value higher, _delete_multi() would maybe
+                    # delete some entries from the *keys* list that did not get
+                    # deleted and would miss them in a retry.
+                    detected_features.max_deletes = min(1000,
+                        int(bulk_delete.get('max_failed_deletes', 1000)))
+
 
                 log.info('Detected Swift features for %s:%s: %s',
                          hostname, port, detected_features, extra=LOG_ONCE)
@@ -762,6 +811,29 @@ class Backend(AbstractBackend, metaclass=ABCDocstMeta):
                           hostname, port)
 
         self.features = detected_features
+
+    def _do_authentication_expired(self, reason):
+        '''Closes the current connection and raises AuthenticationExpired'''
+        log.info('OpenStack auth token seems to have expired, requesting new one.')
+        self.conn.disconnect()
+        # Force constructing a new connection with a new token, otherwise
+        # the connection will be reestablished with the same token.
+        self.conn = None
+        raise AuthenticationExpired(reason)
+
+def _split_response_status(line):
+    '''Splits a HTTP response line into status code (integer)
+    and status text.
+
+    Returns 2-tuple (int, string)
+
+    Raises ValueError when line is not parsable'''
+    hit = re.match('^([0-9]{3})\s+(.*)$', line)
+    if not hit:
+        log.error('Expected valid Response Status, got: %s',
+                  line)
+        raise ValueError('Expected valid Response Status, got: %s' % line)
+    return (int(hit.group(1)), hit.group(2))
 
 class AuthenticationExpired(Exception):
     '''Raised if the provided Authentication Token has expired'''

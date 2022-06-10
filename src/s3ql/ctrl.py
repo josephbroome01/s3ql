@@ -9,7 +9,7 @@ This work can be distributed under the terms of the GNU GPLv3.
 from .logging import logging, setup_logging
 from .common import assert_fs_owner
 from .parse_args import ArgumentParser
-import llfuse
+import pyfuse3
 import sys
 import textwrap
 
@@ -31,6 +31,7 @@ def parse_args(args):
                          type=(lambda x: x.rstrip('/')),
                          help='Mountpoint of the file system')
 
+    parser.add_log()
     parser.add_debug()
     parser.add_quiet()
     parser.add_version()
@@ -39,6 +40,8 @@ def parse_args(args):
                                        help='may be either of')
     subparsers.required = True
     subparsers.add_parser('flushcache', help='flush file system cache',
+                          parents=[pparser])
+    subparsers.add_parser('dropcache', help='drop file system cache',
                           parents=[pparser])
     subparsers.add_parser('upload-meta', help='Upload metadata',
                           parents=[pparser])
@@ -83,18 +86,21 @@ def main(args=None):
     ctrlfile = assert_fs_owner(path, mountpoint=True)
 
     if options.action == 'flushcache':
-        llfuse.setxattr(ctrlfile, 's3ql_flushcache!', b'dummy')
+        pyfuse3.setxattr(ctrlfile, 's3ql_flushcache!', b'dummy')
 
-    if options.action == 'upload-meta':
-        llfuse.setxattr(ctrlfile, 'upload-meta', b'dummy')
+    elif options.action == 'dropcache':
+        pyfuse3.setxattr(ctrlfile, 's3ql_dropcache!', b'dummy')
+
+    elif options.action == 'upload-meta':
+        pyfuse3.setxattr(ctrlfile, 'upload-meta', b'dummy')
 
     elif options.action == 'log':
         level = getattr(logging, options.level.upper())
         cmd = ('(%r, %r)' % (level, ','.join(options.modules))).encode()
-        llfuse.setxattr(ctrlfile, 'logging', cmd)
+        pyfuse3.setxattr(ctrlfile, 'logging', cmd)
 
     elif options.action == 'cachesize':
-        llfuse.setxattr(ctrlfile, 'cachesize', ('%d' % (options.cachesize * 1024,)).encode())
+        pyfuse3.setxattr(ctrlfile, 'cachesize', ('%d' % (options.cachesize * 1024,)).encode())
 
 if __name__ == '__main__':
     main(sys.argv[1:])

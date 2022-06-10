@@ -1,28 +1,44 @@
-dist: trusty
-sudo: enabled
+# TravisCI configuration for szepeviktor/s3ql
 
-language: python
+if: "branch = master"
+
+language: "python"
+os:
+  - "linux"
+# https://docs.travis-ci.com/user/languages/python/#python-versions
+dist: "focal"
+
 python:
-  - "3.3"
-  - "3.4"
-  - "3.5"
-  - "3.6"
-  - "nightly"
+  - "3.7"
+  - "3.8"
+  - "3.9"
   - "pypy3"
 
+addons:
+  apt:
+    packages:
+    - "gcc"
+    - "psmisc"
+    - "pkg-config"
+    - "libattr1-dev"
+    - "libsqlite3-dev"
+    - "libjs-sphinxdoc"
+    - "python3-pip"
+    - "python3-setuptools"
+    - "ninja-build"
+    - "meson"
+
+cache: "pip"
+
 before_install:
-  - sudo apt-get update -qq
-  - sudo apt-get install -y fuse psmisc pkg-config libattr1-dev libfuse-dev libsqlite3-dev libjs-sphinxdoc texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-generic-extra texlive-fonts-recommended
   - "printf 'Current libsqlite3-dev version: %s' $(dpkg-query --show --showformat='${Version}' libsqlite3-dev)"
 
 install:
-  - pip install https://github.com/rogerbinns/apsw/releases/download/3.8.2-r1/apsw-3.8.2-r1.zip
-  - pip install cython==0.24.1 sphinx pycrypto defusedxml requests "llfuse >= 1.0, < 2.0" "dugong >= 3.4, < 4.0" "pytest >= 2.7" pytest-catchlog
+  - "tests/travis-install.sh"
 
 script:
-  - |
-    python setup.py build_cython \
-    && python setup.py build_ext --inplace \
-    && python -m pytest tests/ \
-    && python setup.py build_sphinx \
-    && sudo python setup.py install
+  - "python setup.py build_cython || travis_terminate 1"
+  - "python setup.py build_ext --inplace || travis_terminate 1"
+  - "python setup.py test || travis_terminate 1"
+  - "bash build_docs.sh || travis_terminate 1"
+  - "python setup.py install"

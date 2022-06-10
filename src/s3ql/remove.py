@@ -9,7 +9,7 @@ This work can be distributed under the terms of the GNU GPLv3.
 from .logging import logging, setup_logging, QuietError
 from .common import assert_fs_owner, path2bytes
 from .parse_args import ArgumentParser
-import llfuse
+import pyfuse3
 import os
 import sys
 import textwrap
@@ -25,6 +25,7 @@ def parse_args(args):
         including immutable entries.
         '''))
 
+    parser.add_log()
     parser.add_debug()
     parser.add_quiet()
     parser.add_version()
@@ -51,9 +52,13 @@ def main(args=None):
 
         ctrlfile = assert_fs_owner(name)
         fstat_p = os.stat(os.path.dirname(os.path.abspath(name)))
+
+        # Make sure that write cache is flushed
+        pyfuse3.syncfs(name)
+
         cmd = ('(%d, %r)' % (fstat_p.st_ino,
                              path2bytes(os.path.basename(name)))).encode()
-        llfuse.setxattr(ctrlfile, 'rmtree', cmd)
+        pyfuse3.setxattr(ctrlfile, 'rmtree', cmd)
 
 if __name__ == '__main__':
     main(sys.argv[1:])
